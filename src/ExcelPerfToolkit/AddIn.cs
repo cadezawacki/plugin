@@ -28,6 +28,12 @@ public sealed class AddIn : IExcelAddIn
             bitness,
             SafeGetExcelVersion());
         ExcelIntegration.RegisterUnhandledExceptionHandler(OnUnhandledException);
+        // Reset the toolkit-wide cancellation source so any background work spun up
+        // by VectorizedKernels / RtdServer / DirectFileIO honors a fresh shutdown
+        // token. The RTD server itself is registered automatically by Excel-DNA from
+        // its [ProgId] attribute on first use; we only need to manage the lifetime
+        // of background producers, which observe ToolkitLifetime.ShutdownToken.
+        ToolkitLifetime.Reset();
     }
 
     /// <summary>
@@ -37,6 +43,12 @@ public sealed class AddIn : IExcelAddIn
     /// </summary>
     public void AutoClose()
     {
+        // Cancel any background producers (RTD feeds, in-flight async file I/O) so
+        // the unload returns promptly without leaving worker tasks running against
+        // a torn-down host. Each subsystem observes ToolkitLifetime.ShutdownToken
+        // and shuts down its own resources.
+        ToolkitLifetime.Shutdown();
+        FeedManager.Instance.Shutdown();
         TraceSource.TraceInformation("ExcelPerfToolkit unloaded.");
     }
 

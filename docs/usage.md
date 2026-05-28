@@ -356,11 +356,176 @@ arr = Application.Run("EPT.PARALLELTANH", arr)
 arr = Application.Run("EPT.PARALLELROWREDUCE", arr, "mean")
 ```
 
+## Vectorized (SIMD) kernels
+
+All `EPT.SIMD.*` UDFs are registered with `IsThreadSafe = true`. They
+operate entirely on numeric content; non-numeric cells are coerced to 0.
+The SIMD path is gated at runtime: hosts without `Vector<T>` hardware
+acceleration silently use the scalar fallback and produce identical
+results.
+
+### `EPT.SIMD.CAPABILITIES()`
+
+Returns a one-row block of `(HardwareAccelerated, VectorWidth, Avx2, Fma)`.
+
+```
+=EPT.SIMD.CAPABILITIES()
+```
+
+```vba
+Dim caps As Variant
+caps = Application.Run("EPT.SIMD.CAPABILITIES")
+```
+
+### `EPT.SIMD.ADD(a, b)` / `EPT.SIMD.MULTIPLY(a, b)`
+
+Element-wise add or multiply over two equally-shaped numeric blocks.
+
+```
+=EPT.SIMD.ADD(Data!A1:Z1000, Data!AA1:AZ1000)
+=EPT.SIMD.MULTIPLY(Data!A1:Z1000, Data!AA1:AZ1000)
+```
+
+```vba
+arr = Application.Run("EPT.SIMD.ADD", a, b)
+arr = Application.Run("EPT.SIMD.MULTIPLY", a, b)
+```
+
+### `EPT.SIMD.SCALE(block, factor)`
+
+Multiply every element by a scalar.
+
+```
+=EPT.SIMD.SCALE(Data!A1:Z1000, 2.5)
+```
+
+```vba
+arr = Application.Run("EPT.SIMD.SCALE", a, 2.5)
+```
+
+### `EPT.SIMD.DOT(a, b)`
+
+Dot product over two flattened equal-length vectors. AVX2+FMA path is used
+when supported.
+
+```
+=EPT.SIMD.DOT(Data!A1:A100000, Data!B1:B100000)
+```
+
+```vba
+Dim d As Double
+d = Application.Run("EPT.SIMD.DOT", a, b)
+```
+
+### `EPT.SIMD.ROWSUMS(block)` / `EPT.SIMD.COLSUMS(block)`
+
+```
+=EPT.SIMD.ROWSUMS(Data!A1:Z10000)
+=EPT.SIMD.COLSUMS(Data!A1:Z10000)
+```
+
+```vba
+arr = Application.Run("EPT.SIMD.ROWSUMS", a)
+arr = Application.Run("EPT.SIMD.COLSUMS", a)
+```
+
+### `EPT.SIMD.NORMALIZE(block)`
+
+L2 normalize the block treated as a flat vector.
+
+```
+=EPT.SIMD.NORMALIZE(Data!A1:Z1000)
+```
+
+```vba
+arr = Application.Run("EPT.SIMD.NORMALIZE", a)
+```
+
+### `EPT.SIMD.MATMUL(a, b)`
+
+Matrix multiply; inner dimensions must agree.
+
+```
+=EPT.SIMD.MATMUL(Data!A1:C100, Data!E1:G3)
+```
+
+```vba
+arr = Application.Run("EPT.SIMD.MATMUL", a, b)
+```
+
+## Real-time data: `EPT.RTD`
+
+Subscribe to a topic on the multithreaded `EPT.Rtd` server. Updates push
+from background threads through a 250 ms throttle into Excel.
+
+```
+=EPT.RTD("clock")               ' wall-clock UTC, ticks ~4x/sec on the producer, throttled to 4 Hz outbound
+=EPT.RTD("counter:500")         ' increments every 500 ms
+=EPT.RTD("sine:2:5")            ' sine wave, freq=2 Hz, amplitude=5
+=EPT.RTD("random")              ' uniform random doubles in [0, 1)
+```
+
+The native Excel form is equivalent:
+
+```
+=RTD("EPT.Rtd",,"sine:2:5")
+```
+
+From VBA, drive RTD subscriptions by writing the formula into a cell. RTD
+subscriptions cannot be opened by `Application.Run`; that is by design - the
+server is owned by Excel's RTD lifecycle:
+
+```vba
+Worksheets("Live").Range("A1").Formula = "=EPT.RTD(""clock"")"
+```
+
+> **Critical safety warning - restated.** The RTD producer threads (the
+> `Feed.RunAsync` loops in `RtdServer.cs`) and the throttle flush timer
+> **must never** touch the Excel object model. `Topic.UpdateValue` is the
+> single safe boundary into Excel; Excel-DNA marshals it onto Excel's
+> dedicated RTD thread. Any thread-safe UDF you write that participates in
+> RTD acquisition must obey the same rule: no `ExcelDnaUtil.Application`,
+> no `ExcelReference.GetValue` / `SetValue`, no non-pure `XlCall` entries.
+> Doing so will crash Excel or hang the COM apartment.
+
+## Direct file I/O
+
+### `EPT.READCSV(path, [delimiter], [encoding], [coerceNumeric])`
+
+Stream a delimited text file directly into a bulk array.
+
+```
+=EPT.READCSV("C:\data\prices.csv")
+=EPT.READCSV("C:\data\prices.tsv","\t")
+=EPT.READCSV("C:\data\prices.csv",",","windows-1252",FALSE)
+```
+
+```vba
+Dim arr As Variant
+arr = Application.Run("EPT.READCSV", "C:\data\prices.csv")
+Worksheets("Data").Range("A1").Resize(UBound(arr, 1), UBound(arr, 2)).Value = arr
+```
+
+### `EPT.WRITECSV(path, block, [delimiter], [encoding])`
+
+Stream a worksheet block out to a delimited file. Returns the row count.
+
+```
+=EPT.WRITECSV("C:\out\result.csv", Data!A1:Z1000)
+=EPT.WRITECSV("C:\out\result.tsv", Data!A1:Z1000,"\t")
+```
+
+```vba
+Dim n As Double
+n = Application.Run("EPT.WRITECSV", "C:\out\result.csv", _
+                    Worksheets("Data").Range("A1:Z1000").Value)
+```
+
 ## Public .NET-only entry points
 
-These are not registered as UDFs because they take delegates or
-`ExcelReference` directly, but they are public on the assembly so any other
-add-in can consume them.
+These are not registered as UDFs because they take delegates,
+`ExcelReference`, spans of `double`, or `CancellationToken` directly, but
+they are public on the assembly so any other add-in can consume them.
 
 - `BulkTransfer.ResolveRange(sheet, a1) -> ExcelReference`
 - `BulkTransfer.ReadBlock(ExcelReference) -> object[,]`
@@ -368,6 +533,9 @@ add-in can consume them.
 - `BulkTransfer.RoundTripTransform(ExcelReference, Func<object[,], object[,]>)`
 - `BulkTransfer.ReadDoubleBlock` / `WriteDoubleBlock` / `ReadStringBlock`
 - `ParallelUtilities.ParallelBatchTransform(double[,], double[,], RowTransform, int, int?)`
+- `VectorizedKernels.ElementWiseAdd` / `ElementWiseMultiply` / `Scale` / `DotProduct` / `RowSums` / `ColumnSums` / `L2Normalize` / `MatrixMultiply` - all on `Span<double>` / `ReadOnlySpan<double>`.
+- `DirectFileIO.ReadDelimitedAsync(path, delim, encoding, coerceNumeric, ct) -> Task<object[,]>`
+- `DirectFileIO.WriteDelimitedAsync(path, block, delim, encoding, newLine, ct) -> Task`
 - `Marshaling.*` - the full conversion surface.
 
 ## VBA pattern: read-bulk, transform-managed, write-bulk
