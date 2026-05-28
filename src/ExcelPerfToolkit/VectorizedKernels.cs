@@ -67,7 +67,15 @@ public static class VectorizedKernels
         ArgumentNullException.ThrowIfNull(block);
         rows = block.GetLength(0);
         cols = block.GetLength(1);
-        var result = new double[rows * cols];
+        // Excel max range exceeds Int32.MaxValue cells; use long to detect overflow
+        // before allocation so we surface a clear ArgumentException instead of
+        // wrapping to a too-small buffer and indexing past it.
+        var total = (long)rows * cols;
+        if (total > int.MaxValue)
+        {
+            throw new ArgumentException($"Block too large: {rows}x{cols} = {total} cells exceeds Int32.MaxValue.", nameof(block));
+        }
+        var result = new double[(int)total];
         var idx = 0;
         for (var r = 0; r < rows; r++)
         {
@@ -86,7 +94,9 @@ public static class VectorizedKernels
     internal static object[,] BoxFlatDoubles(double[] flat, int rows, int cols)
     {
         ArgumentNullException.ThrowIfNull(flat);
-        if (flat.Length != rows * cols)
+        // long-cast the comparison so a wrapped int product can't accidentally equal
+        // flat.Length and let a too-small buffer through.
+        if ((long)flat.Length != (long)rows * cols)
         {
             throw new ArgumentException("Flat buffer length does not match dimensions.", nameof(flat));
         }
@@ -160,7 +170,7 @@ public static class VectorizedKernels
             ElementWiseAdd(flatA, flatB, dest);
             return BoxFlatDoubles(dest, rows, cols);
         }
-        catch (Exception ex)
+        catch (Exception ex) when (!IsCritical(ex))
         {
             TraceSource.TraceEvent(TraceEventType.Warning, 1, "EPT.SIMD.ADD failed: {0}", ex.Message);
             return ExcelError.ExcelErrorValue;
@@ -221,7 +231,7 @@ public static class VectorizedKernels
             ElementWiseMultiply(flatA, flatB, dest);
             return BoxFlatDoubles(dest, rows, cols);
         }
-        catch (Exception ex)
+        catch (Exception ex) when (!IsCritical(ex))
         {
             TraceSource.TraceEvent(TraceEventType.Warning, 1, "EPT.SIMD.MULTIPLY failed: {0}", ex.Message);
             return ExcelError.ExcelErrorValue;
@@ -279,7 +289,7 @@ public static class VectorizedKernels
             Scale(flat, factor, dest);
             return BoxFlatDoubles(dest, rows, cols);
         }
-        catch (Exception ex)
+        catch (Exception ex) when (!IsCritical(ex))
         {
             TraceSource.TraceEvent(TraceEventType.Warning, 1, "EPT.SIMD.SCALE failed: {0}", ex.Message);
             return ExcelError.ExcelErrorValue;
@@ -396,7 +406,7 @@ public static class VectorizedKernels
             }
             return DotProduct(flatA, flatB);
         }
-        catch (Exception ex)
+        catch (Exception ex) when (!IsCritical(ex))
         {
             TraceSource.TraceEvent(TraceEventType.Warning, 1, "EPT.SIMD.DOT failed: {0}", ex.Message);
             return ExcelError.ExcelErrorValue;
@@ -469,7 +479,7 @@ public static class VectorizedKernels
             }
             return result;
         }
-        catch (Exception ex)
+        catch (Exception ex) when (!IsCritical(ex))
         {
             TraceSource.TraceEvent(TraceEventType.Warning, 1, "EPT.SIMD.ROWSUMS failed: {0}", ex.Message);
             return ExcelError.ExcelErrorValue;
@@ -556,7 +566,7 @@ public static class VectorizedKernels
             }
             return result;
         }
-        catch (Exception ex)
+        catch (Exception ex) when (!IsCritical(ex))
         {
             TraceSource.TraceEvent(TraceEventType.Warning, 1, "EPT.SIMD.COLSUMS failed: {0}", ex.Message);
             return ExcelError.ExcelErrorValue;
@@ -581,7 +591,12 @@ public static class VectorizedKernels
         }
         var sumSq = DotProduct(source, source);
         var norm = Math.Sqrt(sumSq);
-        if (norm == 0d)
+        // If the squared sum overflows to infinity, norm is +Inf; dividing by it
+        // would silently zero the destination while we returned +Inf as the norm.
+        // Treat non-finite norm the same as zero norm: return zeros and norm=0 so
+        // the caller can detect the overflow via the return value being 0 despite
+        // a non-empty source.
+        if (norm == 0d || double.IsNaN(norm) || double.IsInfinity(norm))
         {
             destination.Clear();
             return 0d;
@@ -611,7 +626,7 @@ public static class VectorizedKernels
             L2Normalize(flat, dest);
             return BoxFlatDoubles(dest, rows, cols);
         }
-        catch (Exception ex)
+        catch (Exception ex) when (!IsCritical(ex))
         {
             TraceSource.TraceEvent(TraceEventType.Warning, 1, "EPT.SIMD.NORMALIZE failed: {0}", ex.Message);
             return ExcelError.ExcelErrorValue;
@@ -634,11 +649,13 @@ public static class VectorizedKernels
         ReadOnlySpan<double> b, int kBRows, int n,
         Span<double> destination)
     {
-        if (a.Length != m * k)
+        // long-cast every shape product so an int-overflow can't make a too-small
+        // buffer compare equal to the wrapped product and slip past validation.
+        if ((long)a.Length != (long)m * k)
         {
             throw new ArgumentException("A's length does not match m*k.", nameof(a));
         }
-        if (b.Length != kBRows * n)
+        if ((long)b.Length != (long)kBRows * n)
         {
             throw new ArgumentException("B's length does not match k*n.", nameof(b));
         }
@@ -646,7 +663,7 @@ public static class VectorizedKernels
         {
             throw new ArgumentException("A.cols must equal B.rows.");
         }
-        if (destination.Length != m * n)
+        if ((long)destination.Length != (long)m * n)
         {
             throw new ArgumentException("Destination length must be m*n.", nameof(destination));
         }
@@ -696,7 +713,7 @@ public static class VectorizedKernels
             MatrixMultiply(flatA, m, k, flatB, kB, n, dest);
             return BoxFlatDoubles(dest, m, n);
         }
-        catch (Exception ex)
+        catch (Exception ex) when (!IsCritical(ex))
         {
             TraceSource.TraceEvent(TraceEventType.Warning, 1, "EPT.SIMD.MATMUL failed: {0}", ex.Message);
             return ExcelError.ExcelErrorValue;
@@ -743,4 +760,16 @@ public static class VectorizedKernels
             throw new ArgumentException("Inputs must have identical shapes.");
         }
     }
+
+    /// <summary>
+    /// Returns true for exception types we must NOT swallow in the UDF boundary catch.
+    /// OutOfMemoryException etc. signal process-wide problems that can't be papered over
+    /// by surfacing #VALUE!; rethrowing lets Excel-DNA's unhandled handler at least log
+    /// the real cause.
+    /// </summary>
+    private static bool IsCritical(Exception ex)
+        => ex is OutOfMemoryException
+            or StackOverflowException
+            or AccessViolationException
+            or ThreadAbortException;
 }

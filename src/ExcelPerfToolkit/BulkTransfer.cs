@@ -38,12 +38,28 @@ public static class BulkTransfer
         {
             throw new ArgumentException("A1 address is required.", nameof(a1Address));
         }
+        // Reject sheet-name characters that would let a malformed argument escape the
+        // single-quoted sheet name in xlfEvaluate (workbook-qualifier injection).
+        if (sheetName.IndexOfAny(new[] { '[', ']', '\r', '\n' }) >= 0)
+        {
+            throw new ArgumentException($"Sheet name '{sheetName}' contains invalid characters.", nameof(sheetName));
+        }
 
         var qualified = a1Address.Contains('!', StringComparison.Ordinal)
             ? a1Address
             : string.Concat("'", sheetName.Replace("'", "''", StringComparison.Ordinal), "'!", a1Address);
 
-        var token = XlCall.Excel(XlCall.xlfEvaluate, qualified);
+        object token;
+        try
+        {
+            token = XlCall.Excel(XlCall.xlfEvaluate, qualified);
+        }
+        catch (XlCallException ex)
+        {
+            // Translate Excel-DNA's XlCallException (raised on xlretFailed / xlretInvXlfn /
+            // etc.) into the documented contract for this method: ArgumentException.
+            throw new ArgumentException($"Range '{qualified}' could not be evaluated: {ex.Message}.", nameof(a1Address), ex);
+        }
         if (token is ExcelReference r)
         {
             return r;
@@ -121,6 +137,18 @@ public static class BulkTransfer
     {
         ArgumentNullException.ThrowIfNull(block);
         var anchor = ResolveRange(sheetName, anchorA1);
+        // Invariant: when the caller supplies a multi-cell anchor it must already match
+        // the block's shape. Silently expanding a 2x2 anchor to a 3x3 write would stomp
+        // cells the caller did not name.
+        var anchorRows = anchor.RowLast - anchor.RowFirst + 1;
+        var anchorCols = anchor.ColumnLast - anchor.ColumnFirst + 1;
+        if ((anchorRows != 1 || anchorCols != 1)
+            && (anchorRows != block.GetLength(0) || anchorCols != block.GetLength(1)))
+        {
+            throw new ArgumentException(
+                $"Anchor range {anchorRows}x{anchorCols} does not match block {block.GetLength(0)}x{block.GetLength(1)}; pass a single-cell anchor or a matching range.",
+                nameof(anchorA1));
+        }
         var target = new ExcelReference(
             anchor.RowFirst,
             anchor.RowFirst + block.GetLength(0) - 1,

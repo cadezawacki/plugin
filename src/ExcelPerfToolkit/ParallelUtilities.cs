@@ -463,9 +463,11 @@ public static class ParallelUtilities
         var ca = a.GetLength(1);
         var rb = b.GetLength(0);
         var cb = b.GetLength(1);
-        var na = ra * ca;
-        var nb = rb * cb;
-        if (na != nb)
+        // long-cast so an int-multiplication overflow can't make a mismatched pair of
+        // shapes appear equal under matched wrap.
+        var na = (long)ra * ca;
+        var nb = (long)rb * cb;
+        if (na != nb || na > int.MaxValue)
         {
             return ExcelError.ExcelErrorValue;
         }

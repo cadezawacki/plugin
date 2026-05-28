@@ -57,6 +57,11 @@ public sealed class RtdServer : ExcelRtdServer
 
     private readonly ConcurrentDictionary<int, TopicRegistration> _topics = new();
     private Timer? _flushTimer;
+    // Reentrancy gate for FlushTick. If a tick takes longer than the period (e.g. with
+    // tens of thousands of topics or a slow UpdateValue queue), Timer fires the
+    // callback again on a different ThreadPool thread. Without this gate, two threads
+    // would both iterate _topics and race writes to TopicRegistration.LastPushed.
+    private int _flushInFlight;
 
     /// <inheritdoc/>
     protected override bool ServerStart()
@@ -71,7 +76,17 @@ public sealed class RtdServer : ExcelRtdServer
     {
         TraceSource.TraceInformation("RTD server terminating, releasing {0} topics.", _topics.Count);
         var timer = Interlocked.Exchange(ref _flushTimer, null);
-        timer?.Dispose();
+        // Invariant: by the time we return from this method, no FlushTick callback
+        // can still be running. Timer.Dispose() alone returns immediately without
+        // waiting for a pending callback, so we use the WaitHandle overload to join.
+        if (timer is not null)
+        {
+            using var done = new ManualResetEvent(false);
+            if (timer.Dispose(done))
+            {
+                done.WaitOne();
+            }
+        }
         foreach (var reg in _topics.Values)
         {
             reg.Feed.Unsubscribe(reg);
@@ -90,6 +105,15 @@ public sealed class RtdServer : ExcelRtdServer
             var spec = topicInfo.Count > 0 ? topicInfo[0] : string.Empty;
             var feed = FeedManager.Instance.GetOrCreate(spec);
             var reg = new TopicRegistration(topic, feed);
+            // If Excel re-issues ConnectData for the same TopicId without an
+            // intervening DisconnectData (rare but observed), the prior registration
+            // would otherwise be silently orphaned in its Feed's _subscribers - keeping
+            // that Feed's producer running forever for a topic we no longer track.
+            // Unsubscribe the old reg before overwriting.
+            if (_topics.TryGetValue(topic.TopicId, out var existing))
+            {
+                existing.Feed.Unsubscribe(existing);
+            }
             _topics[topic.TopicId] = reg;
             feed.Subscribe(reg);
             newValues = true;
@@ -119,22 +143,40 @@ public sealed class RtdServer : ExcelRtdServer
     {
         // Runs on a ThreadPool thread, NOT on Excel's RTD thread. UpdateValue itself
         // is the COM-marshaled boundary; Excel-DNA hands it across safely.
+        //
+        // Reentrancy gate: if a previous tick is still running (e.g. large topic set
+        // backing up Excel-DNA's marshaling queue), skip this tick rather than racing
+        // a sibling iteration over the same _topics and LastPushed writes.
+        if (Interlocked.CompareExchange(ref _flushInFlight, 1, 0) != 0)
+        {
+            return;
+        }
         try
         {
             foreach (var kv in _topics)
             {
+                // Per-topic try/catch: an exception inside one Topic.UpdateValue must
+                // NOT abort the rest of the tick. A deterministically-throwing topic
+                // would otherwise starve every sibling topic of updates forever.
                 var reg = kv.Value;
-                var current = reg.Feed.LatestValue;
-                if (!ReferenceEquals(current, reg.LastPushed) && !Equals(current, reg.LastPushed))
+                try
                 {
-                    reg.Topic.UpdateValue(current ?? string.Empty);
-                    reg.LastPushed = current;
+                    var current = reg.Feed.LatestValue;
+                    if (!ReferenceEquals(current, reg.LastPushed) && !Equals(current, reg.LastPushed))
+                    {
+                        reg.Topic.UpdateValue(current ?? string.Empty);
+                        reg.LastPushed = current;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    TraceSource.TraceEvent(TraceEventType.Warning, 2, "RTD flush failed for topic {0}: {1}", kv.Key, ex.Message);
                 }
             }
         }
-        catch (Exception ex)
+        finally
         {
-            TraceSource.TraceEvent(TraceEventType.Warning, 2, "RTD flush tick failed: {0}", ex.Message);
+            Volatile.Write(ref _flushInFlight, 0);
         }
     }
 
@@ -216,11 +258,25 @@ internal sealed class FeedManager
     /// Gets or creates the feed for <paramref name="spec"/>. Concurrency-safe: only one
     /// feed instance is created per distinct spec even under racing connect calls.
     /// </summary>
+    /// <summary>
+    /// Hard cap on the number of distinct feed specs we'll create. Each feed owns a
+    /// background Task; an attacker (or buggy formula like <c>="counter:"&amp;ROW()</c>)
+    /// could otherwise create unbounded feeds.
+    /// </summary>
+    public const int MaxDistinctFeeds = 1024;
+
     public Feed GetOrCreate(string spec)
     {
         if (string.IsNullOrWhiteSpace(spec))
         {
             throw new ArgumentException("Spec is required.", nameof(spec));
+        }
+        // Cap is checked optimistically; if a parallel call races us across the cap
+        // we tolerate one or two extra registrations - the dictionary's own concurrency
+        // ensures consistency.
+        if (_feeds.Count >= MaxDistinctFeeds && !_feeds.ContainsKey(spec))
+        {
+            throw new InvalidOperationException($"Feed registry full ({MaxDistinctFeeds} distinct specs). Reduce spec variation.");
         }
         return _feeds.GetOrAdd(spec, static key => CreateFeed(key));
     }
@@ -233,11 +289,26 @@ internal sealed class FeedManager
     {
         lock (_gate)
         {
-            foreach (var f in _feeds.Values)
+            // try/finally so that any single Feed.Stop() exception still leaves the
+            // registry empty - otherwise a stale dead feed lingers across re-opens.
+            try
             {
-                f.Stop();
+                foreach (var f in _feeds.Values)
+                {
+                    try
+                    {
+                        f.Stop();
+                    }
+                    catch (Exception ex)
+                    {
+                        TraceSource.TraceEvent(TraceEventType.Warning, 4, "Feed.Stop threw during shutdown for '{0}': {1}", f.Spec, ex.Message);
+                    }
+                }
             }
-            _feeds.Clear();
+            finally
+            {
+                _feeds.Clear();
+            }
         }
         TraceSource.TraceInformation("FeedManager shut down.");
     }
@@ -325,9 +396,20 @@ internal abstract class Feed
     /// </summary>
     public void Subscribe(TopicRegistration reg)
     {
-        _subscribers[reg.Topic.TopicId] = reg;
+        // Invariant: _subscribers mutation and the start/stop decision are made under
+        // the same lock so a concurrent Unsubscribe cannot read IsEmpty and call Stop
+        // between the add and the producer-start.
         lock (_gate)
         {
+            _subscribers[reg.Topic.TopicId] = reg;
+            // Subscribe-after-shutdown is a no-op: a linked CTS over an already-cancelled
+            // parent would fire synchronously and Task.Run with a cancelled token never
+            // invokes the action, leaving _producer.IsCompleted == true and looping us
+            // into a stillborn-restart pattern on every subsequent Subscribe.
+            if (ToolkitLifetime.ShutdownToken.IsCancellationRequested)
+            {
+                return;
+            }
             if (_producer is null || _producer.IsCompleted)
             {
                 _cts = CancellationTokenSource.CreateLinkedTokenSource(ToolkitLifetime.ShutdownToken);
@@ -342,10 +424,16 @@ internal abstract class Feed
     /// </summary>
     public void Unsubscribe(TopicRegistration reg)
     {
-        _subscribers.TryRemove(reg.Topic.TopicId, out _);
-        if (_subscribers.IsEmpty)
+        // Invariant: the Remove + IsEmpty check + Stop happen under the lock as a
+        // single atomic decision, so a concurrent Subscribe cannot see "no producer"
+        // immediately after we decided to stop one.
+        lock (_gate)
         {
-            Stop();
+            _subscribers.TryRemove(reg.Topic.TopicId, out _);
+            if (_subscribers.IsEmpty)
+            {
+                StopLocked();
+            }
         }
     }
 
@@ -356,18 +444,30 @@ internal abstract class Feed
     {
         lock (_gate)
         {
-            try
-            {
-                _cts?.Cancel();
-            }
-            catch (ObjectDisposedException)
-            {
-                // Already disposed; benign.
-            }
-            _cts?.Dispose();
-            _cts = null;
-            _producer = null;
+            StopLocked();
         }
+    }
+
+    /// <summary>
+    /// Caller must hold <see cref="_gate"/>. Cancels the producer's CTS and clears the
+    /// producer reference, but does NOT dispose the CTS while the producer may still
+    /// be inside <c>await Task.Delay(token)</c> - Delay's internal registration cleanup
+    /// races a synchronous Dispose. Letting the GC finalize the CTS after the Task
+    /// completes is the safe path; tradeoff is a brief delay before the unmanaged
+    /// wait handle is released.
+    /// </summary>
+    private void StopLocked()
+    {
+        try
+        {
+            _cts?.Cancel();
+        }
+        catch (ObjectDisposedException)
+        {
+            // Already disposed; benign.
+        }
+        _cts = null;
+        _producer = null;
     }
 
     private async Task RunSafelyAsync(CancellationToken cancellationToken)

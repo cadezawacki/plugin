@@ -54,8 +54,17 @@ public sealed class AddIn : IExcelAddIn
 
     private static object OnUnhandledException(object exceptionObject)
     {
-        var ex = exceptionObject as Exception;
-        TraceSource.TraceEvent(TraceEventType.Error, 0, "Unhandled UDF exception: {0}", ex);
+        // Excel-DNA calls this with either the Exception thrown by the UDF or the
+        // original return value when the UDF returned an unmarshalable object.
+        // Log whichever it is so non-Exception payloads aren't dropped on the floor.
+        if (exceptionObject is Exception ex)
+        {
+            TraceSource.TraceEvent(TraceEventType.Error, 0, "Unhandled UDF exception: {0}", ex);
+        }
+        else
+        {
+            TraceSource.TraceEvent(TraceEventType.Error, 0, "Unhandled UDF return: {0}", exceptionObject);
+        }
         return ExcelError.ExcelErrorValue;
     }
 
@@ -64,6 +73,12 @@ public sealed class AddIn : IExcelAddIn
         try
         {
             var v = XlCall.Excel(XlCall.xlfGetWorkspace, 2);
+            // xlfGetWorkspace can return an ExcelError boxed in object (rather than
+            // throwing) when Excel is not ready. Don't surface that as "Excel version".
+            if (v is ExcelError)
+            {
+                return "unknown";
+            }
             return v?.ToString() ?? "unknown";
         }
         catch (XlCallException)

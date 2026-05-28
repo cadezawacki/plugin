@@ -415,7 +415,11 @@ public static class DeveloperUtilities
         {
             try
             {
-                rx = new Regex(find, RegexOptions.CultureInvariant);
+                // MatchTimeout is the surgical ReDoS defense: any pathological pattern
+                // (e.g. (a+)+$) will throw RegexMatchTimeoutException instead of pinning
+                // the calc thread forever. The 1s budget is generous for any real Excel
+                // workflow and short enough to keep the workbook responsive.
+                rx = new Regex(find, RegexOptions.CultureInvariant, TimeSpan.FromSeconds(1));
             }
             catch (ArgumentException ex)
             {
@@ -431,9 +435,19 @@ public static class DeveloperUtilities
                 var cell = block[r, c];
                 if (cell is string s)
                 {
-                    result[r, c] = rx is null
-                        ? s.Replace(find, replace, StringComparison.Ordinal)
-                        : rx.Replace(s, replace);
+                    try
+                    {
+                        result[r, c] = rx is null
+                            ? s.Replace(find, replace, StringComparison.Ordinal)
+                            : rx.Replace(s, replace);
+                    }
+                    catch (RegexMatchTimeoutException)
+                    {
+                        // Pathological pattern tripped the per-match budget. Surface the
+                        // failure as a cell error rather than pinning the calc thread.
+                        TraceSource.TraceEvent(TraceEventType.Warning, 3, "EPT.FINDREPLACE regex timeout on cell ({0},{1}).", r, c);
+                        result[r, c] = ExcelError.ExcelErrorValue;
+                    }
                 }
                 else
                 {
@@ -463,7 +477,14 @@ public static class DeveloperUtilities
         ArgumentNullException.ThrowIfNull(block);
         var rows = block.GetLength(0);
         var cols = block.GetLength(1);
-        var result = new object[rows * cols, 1];
+        // Excel's max range is ~16B cells which overflows int multiplication.
+        // Compute the product as long and reject before allocation rather than wrapping.
+        var total = (long)rows * cols;
+        if (total > int.MaxValue)
+        {
+            throw new ArgumentException($"Block too large: {rows}x{cols} = {total} cells exceeds Int32.MaxValue.", nameof(block));
+        }
+        var result = new object[(int)total, 1];
         var idx = 0;
         for (var c = 0; c < cols; c++)
         {
@@ -499,7 +520,14 @@ public static class DeveloperUtilities
 
         var dataRows = rows - 1;
         var valueColumns = cols - keyColumns;
-        var outRows = dataRows * valueColumns;
+        // Guard against int overflow: dataRows * valueColumns can exceed Int32.MaxValue
+        // for worksheet-sized blocks. Reject up front rather than wrapping.
+        var outRowsLong = (long)dataRows * valueColumns;
+        if (outRowsLong > int.MaxValue)
+        {
+            throw new ArgumentException($"Unpivoted shape {outRowsLong} rows exceeds Int32.MaxValue.", nameof(block));
+        }
+        var outRows = (int)outRowsLong;
         var outCols = keyColumns + 2; // + Attribute + Value
         var result = new object[outRows, outCols];
 
@@ -726,6 +754,12 @@ public static class DeveloperUtilities
                 {
                     throw new ArgumentException("Return column indexes must be numbers.");
                 }
+                // Bounds-check before the cast so an out-of-range value is reported
+                // verbatim instead of silently wrapping to a negative int.
+                if (d < 0d || d > int.MaxValue || d != Math.Truncate(d))
+                {
+                    throw new ArgumentException($"Column index {d} is not a non-negative integer fitting Int32.");
+                }
                 list.Add((int)d);
             }
         }
@@ -760,6 +794,9 @@ public static class DeveloperUtilities
         ArgumentNullException.ThrowIfNull(keyColumns);
 
         var keys = FlattenIntIndexes(keyColumns);
+        // Excel marshals an array argument as object[,]; a single-cell argument like
+        // TRUE comes through as a bare bool/double/string. Accept both forms - the
+        // scalar case applies the same flag to every key column.
         bool[] desc;
         if (descendingFlags is object[,] flagsBlock)
         {
@@ -775,20 +812,20 @@ public static class DeveloperUtilities
                     {
                         continue;
                     }
-                    flat.Add(v switch
-                    {
-                        bool b => b,
-                        double d => d != 0d,
-                        string s => s.Equals("TRUE", StringComparison.OrdinalIgnoreCase) || s == "1",
-                        _ => false,
-                    });
+                    flat.Add(CoerceBool(v));
                 }
             }
             desc = flat.Count >= keys.Length ? flat.Take(keys.Length).ToArray() : flat.Concat(Enumerable.Repeat(false, keys.Length - flat.Count)).ToArray();
         }
-        else
+        else if (Marshaling.IsBlankOrError(descendingFlags))
         {
             desc = new bool[keys.Length];
+        }
+        else
+        {
+            // Scalar TRUE/FALSE/1/0/"TRUE" applies to every key.
+            var b = CoerceBool(descendingFlags);
+            desc = Enumerable.Repeat(b, keys.Length).ToArray();
         }
 
         var rows = block.GetLength(0);
@@ -807,6 +844,16 @@ public static class DeveloperUtilities
         }
         return result;
     }
+
+    private static bool CoerceBool(object? value) => value switch
+    {
+        bool b => b,
+        double d => d != 0d,
+        int i => i != 0,
+        long l => l != 0L,
+        string s => s.Equals("TRUE", StringComparison.OrdinalIgnoreCase) || s == "1",
+        _ => false,
+    };
 
     private static int CompareRows(object[,] block, int a, int b, int[] keys, bool[] desc)
     {
@@ -891,10 +938,11 @@ public static class DeveloperUtilities
         var rows = block.GetLength(0);
         var cols = block.GetLength(1);
         using var sha = SHA256.Create();
-        Span<byte> separator = stackalloc byte[1];
-        separator[0] = 0x1f;
-        Span<byte> rowSeparator = stackalloc byte[1];
-        rowSeparator[0] = 0x1e;
+        // Allocate the separator byte arrays ONCE outside the hot loop. The previous
+        // implementation called Span.ToArray() per cell, producing up to N*cells throwaway
+        // arrays for a worksheet-size block.
+        var separator = new byte[] { 0x1f };
+        var rowSeparator = new byte[] { 0x1e };
         for (var r = 0; r < rows; r++)
         {
             for (var c = 0; c < cols; c++)
@@ -902,11 +950,9 @@ public static class DeveloperUtilities
                 var text = Marshaling.ToStringSafe(block[r, c]);
                 var bytes = Encoding.UTF8.GetBytes(text);
                 sha.TransformBlock(bytes, 0, bytes.Length, null, 0);
-                var sep = separator.ToArray();
-                sha.TransformBlock(sep, 0, sep.Length, null, 0);
+                sha.TransformBlock(separator, 0, separator.Length, null, 0);
             }
-            var rowSep = rowSeparator.ToArray();
-            sha.TransformBlock(rowSep, 0, rowSep.Length, null, 0);
+            sha.TransformBlock(rowSeparator, 0, rowSeparator.Length, null, 0);
         }
         sha.TransformFinalBlock(Array.Empty<byte>(), 0, 0);
         return Convert.ToHexString(sha.Hash ?? Array.Empty<byte>());

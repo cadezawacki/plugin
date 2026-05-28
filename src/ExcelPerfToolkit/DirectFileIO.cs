@@ -66,7 +66,9 @@ public static class DirectFileIO
             path,
             FileMode.Open,
             FileAccess.Read,
-            FileShare.ReadWrite | FileShare.Delete,
+            // Allow concurrent readers but reject concurrent writers/deletes: otherwise
+            // we can read torn lines from a file being appended or truncated.
+            FileShare.Read,
             bufferSize: DefaultBufferSize,
             options: FileOptions.Asynchronous | FileOptions.SequentialScan);
         using var reader = new StreamReader(stream, encoding, detectEncodingFromByteOrderMarks: true, bufferSize: DefaultBufferSize);
@@ -127,11 +129,29 @@ public static class DirectFileIO
                 }
                 if (ch == '"')
                 {
-                    inQuotes = true;
+                    // RFC 4180: a quote only opens a quoted field at the start of a
+                    // field; a quote in the middle of an unquoted field should be a
+                    // literal character. The previous code silently flipped into
+                    // quote mode, then consumed delimiters and newlines as field
+                    // content until a closing quote. Treat as literal unless the
+                    // field buffer is empty (field hasn't started yet).
+                    if (fieldBuffer.Length == 0)
+                    {
+                        inQuotes = true;
+                        // Reset lastWasCR: opening a quote after \r must not let a
+                        // subsequent newline be eaten as the second half of a CRLF.
+                        lastWasCR = false;
+                        continue;
+                    }
+                    lastWasCR = false;
+                    fieldBuffer.Append(ch);
                     continue;
                 }
                 if (ch == delimiter)
                 {
+                    // Reset lastWasCR so a delimiter immediately after \r doesn't
+                    // leave the flag set; otherwise a following \n is swallowed.
+                    lastWasCR = false;
                     PushField(fieldBuffer, rowBuffer, coerceNumeric);
                     continue;
                 }
@@ -156,6 +176,13 @@ public static class DirectFileIO
                 lastWasCR = false;
                 fieldBuffer.Append(ch);
             }
+        }
+
+        // EOF inside a quoted field is corruption. Surface it rather than silently
+        // flushing the half-quoted content as if the closing quote had arrived.
+        if (inQuotes)
+        {
+            throw new InvalidDataException("CSV ended inside a quoted field (missing closing quote).");
         }
 
         // Flush trailing field/row if the file did not end with a newline.
@@ -401,6 +428,9 @@ public static class DirectFileIO
         }
     }
 
+    /// <summary>The no-BOM UTF-8 encoding used by both read and write defaults.</summary>
+    private static readonly Encoding DefaultUtf8 = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false);
+
     private static char ResolveDelimiter(object delimiter)
     {
         if (Marshaling.IsBlankOrError(delimiter))
@@ -416,27 +446,43 @@ public static class DirectFileIO
         {
             return '\t';
         }
-        return s[0];
+        var ch = s[0];
+        // Reject characters that would break parser invariants: the quote character is
+        // the field-delimiter sentinel, CR/LF are line terminators. Allowing any of
+        // them as the value delimiter would make round-tripping impossible.
+        if (ch == '"' || ch == '\r' || ch == '\n')
+        {
+            throw new ArgumentException($"Invalid delimiter '{ch}': '\"', CR and LF are reserved.", nameof(delimiter));
+        }
+        return ch;
     }
 
     private static Encoding ResolveEncoding(object encoding)
     {
+        // Default to the no-BOM UTF-8 instance so EPT.READCSV and EPT.WRITECSV round-trip
+        // symmetrically. The static Encoding.UTF8 emits a BOM, which would surprise
+        // users vs. the docs that say "no BOM".
         if (Marshaling.IsBlankOrError(encoding))
         {
-            return Encoding.UTF8;
+            return DefaultUtf8;
         }
         var s = Marshaling.ToStringSafe(encoding);
         if (string.IsNullOrWhiteSpace(s))
         {
-            return Encoding.UTF8;
+            return DefaultUtf8;
         }
         try
         {
             return Encoding.GetEncoding(s);
         }
+        catch (NotSupportedException)
+        {
+            // Legacy codepages need CodePagesEncodingProvider, which isn't referenced.
+            return DefaultUtf8;
+        }
         catch (ArgumentException)
         {
-            return Encoding.UTF8;
+            return DefaultUtf8;
         }
     }
 

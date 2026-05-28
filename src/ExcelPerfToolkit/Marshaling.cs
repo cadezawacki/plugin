@@ -99,12 +99,34 @@ public static class Marshaling
                 result = b ? 1d : 0d;
                 return true;
             case DateTime dt:
-                result = dt.ToOADate();
-                return true;
+                // DateTime.ToOADate throws OverflowException for years 1-99 (excluding MinValue).
+                // TryToDouble must not let that escape: contract is "best-effort, no throws".
+                try
+                {
+                    result = dt.ToOADate();
+                    return true;
+                }
+                catch (OverflowException)
+                {
+                    result = 0d;
+                    return false;
+                }
             case string s:
+                // Invariant culture uses ',' as its NumberGroupSeparator. Combined with
+                // NumberStyles.AllowThousands this would parse "1,5" as 15 (treating ',' as
+                // a thousands separator), silently 10x-ing any comma-decimal cell from
+                // de-DE / fr-FR / es-ES workbooks. We must NOT allow thousands separators
+                // in the invariant pass; the current-culture fallback may still use them.
+                // We also cap the length: TryParse is O(n) and would otherwise scan
+                // multi-MB cell strings twice for no benefit.
+                if (s.Length > 64)
+                {
+                    result = 0d;
+                    return false;
+                }
                 return double.TryParse(
                     s,
-                    NumberStyles.Float | NumberStyles.AllowThousands,
+                    NumberStyles.Float,
                     CultureInfo.InvariantCulture,
                     out result)
                     || double.TryParse(s, NumberStyles.Float | NumberStyles.AllowThousands, CultureInfo.CurrentCulture, out result);
@@ -137,7 +159,12 @@ public static class Marshaling
             decimal m => m.ToString(CultureInfo.InvariantCulture),
             bool b => b ? "TRUE" : "FALSE",
             DateTime dt => dt.ToString("o", CultureInfo.InvariantCulture),
-            _ => Convert.ToString(value, CultureInfo.InvariantCulture) ?? string.Empty,
+            // Convert.ToString(object, IFormatProvider) ignores the provider for types
+            // that don't implement IConvertible (it falls through to value.ToString()).
+            // Call IConvertible.ToString(provider) explicitly when we can; otherwise
+            // accept the type's own ToString().
+            IConvertible c => c.ToString(CultureInfo.InvariantCulture) ?? string.Empty,
+            _ => value.ToString() ?? string.Empty,
         };
     }
 
@@ -344,6 +371,13 @@ public static class Marshaling
         {
             if (IsBlankOrError(obj))
             {
+                // Include the specific ExcelError enum value so that NA / DIV/0 / REF
+                // don't all collide into a single bucket - keeps hashed-collection probes
+                // O(1) when error-heavy data flows through CellEquality.
+                if (obj is ExcelError err)
+                {
+                    return HashCode.Combine(typeof(ExcelError), (int)err);
+                }
                 return obj?.GetType().GetHashCode() ?? 0;
             }
             if (TryToDouble(obj, out var d))
