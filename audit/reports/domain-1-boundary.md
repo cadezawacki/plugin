@@ -1,0 +1,17 @@
+# Domain 1 — Boundary & Conversion
+
+**Files:** `AddIn.cs`, `Marshaling.cs`, `BulkTransfer.cs`
+
+NOTE: This agent's findings exceeded its assigned scope and overlap heavily with Domain 4 (RTD + lifetime). Out-of-scope findings are tagged and will be reconciled with the RTD report during synthesis.
+
+| ID | Severity | Location | Category | Failure Scenario | Evidence | Proposed Fix | Confidence |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| B001 (out-of-scope; duplicates RTD-003) | Critical | RtdServer.cs:326-338 (Feed.Subscribe) | Race Condition | Dictionary write outside the lock; Subscribe / Unsubscribe interleaving could double-start or stop producers. | `_subscribers[reg.Topic.TopicId] = reg;` runs before `lock(_gate)`. | Move dict assignment inside the lock. | 0.85 |
+| B002 (out-of-scope; duplicates RTD-003) | High | RtdServer.cs:343-350 (Feed.Unsubscribe) | Race Condition | `IsEmpty` check + `Stop()` are not atomic with Subscribe. | TryRemove then lock-free `IsEmpty` check. | Acquire `_gate` before `IsEmpty` check. | 0.80 |
+| B003 (out-of-scope; duplicates RTD-004) | High | ToolkitLifetime.cs:40-67 | Resource Race | `Reset()` disposes old CTS while observers may still hold its token. | Dispose-then-reassign inside lock. | Reassign first, dispose old outside lock OR document the invalidation. | 0.75 |
+| B004 | Medium | Marshaling.cs:95-97 (TryToDouble decimal branch) | Numeric Overflow | `(double)decimal.MaxValue` may yield ±Infinity. Returns `true` so downstream code sees Infinity and propagates it. | Lines 95-97: `case decimal m: result = (double)m; return true;` | Return `!double.IsInfinity(result) && !double.IsNaN(result)`. | 0.70 |
+| B005 (cross-domain; duplicates RTD-011/012) | Medium | AddIn.cs:44-53 (AutoClose) | Double-shutdown of FeedManager | `RtdServer.ServerTerminate` already calls `FeedManager.Instance.Shutdown()`; `AutoClose` calls it again. | Lines 50-51 + RtdServer.cs:80. | Make `FeedManager.Shutdown` idempotent (it already is) and document the redundancy, OR drop the duplicate call. | 0.65 |
+| B006 | Medium | Marshaling.cs:47-54 (IsBlankOrError) | Contract Ambiguity | Conflates errors with blanks; downstream callers that want to propagate errors might inadvertently swallow them. | Lines 47-54. | Already has `IsExcelError`. Document intent; no code change required. | 0.60 |
+| B007 (out-of-scope; duplicates RTD-002) | Medium | RtdServer.cs:118-139 (FlushTick) | Error scope | Exception in one topic's UpdateValue skips all remaining topics in the tick. | Outer try/catch around the entire foreach. | Move try/catch inside the loop body. | 0.70 |
+| B008 | Low | Marshaling.cs:323-356 (CellEqualityComparer) | Hash/equals NaN inconsistency | `NaN != NaN` but `NaN.GetHashCode() == NaN.GetHashCode()`. Hash/equals contract violated for NaN. Cannot reach in practice because `TryToDouble` rejects NaN. | Lines 343-354 hash path returns `d.GetHashCode()` after `TryToDouble`. | Reject the finding: TryToDouble guards against NaN, so the comparer never sees it from this codebase. Defensive `if (double.IsNaN(d)) return NaN.GetHashCode();` is harmless polish. | 0.50 |
+| B009 | Low | BulkTransfer.cs:142-149 (RoundTripTransform) | Diagnostic | The shape mismatch error fires from `WriteBlock` rather than the transform call, making the failure look like a write problem. | Lines 142-149 + 100-105. | Add an explicit shape check with a clearer message immediately after the transform call. | 0.40 |
