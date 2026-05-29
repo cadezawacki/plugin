@@ -521,6 +521,117 @@ n = Application.Run("EPT.WRITECSV", "C:\out\result.csv", _
                     Worksheets("Data").Range("A1:Z1000").Value)
 ```
 
+## Conditional aggregation (MTR-eligible)
+
+All `EPT.*IFS`, weighted, `SUMPRODUCTIFS`, and `GROUPBY` functions are
+registered with `IsThreadSafe = true`. They are pure CPU over their
+`object[,]` arguments and never touch the Excel object model. Criteria use
+Excel's grammar: `">5"`, `"<=10"`, `"<>x"`, `"=v"`, the wildcards `*`/`?`
+(with `~` escaping a literal wildcard), and the empty-operand blank/non-blank
+forms `""` and `"<>"`. Numeric comparisons match only genuinely numeric
+cells, not numeric-looking text - exactly like Excel.
+
+### Faster `*IFS` (drop-in for the native versions)
+
+```
+=EPT.COUNTIFS(Data!A1:A100000, ">0", Data!B1:B100000, "West")
+=EPT.SUMIFS(Data!C1:C100000, Data!A1:A100000, ">0", Data!B1:B100000, "West")
+=EPT.AVERAGEIFS(Data!C1:C100000, Data!B1:B100000, "W*")
+=EPT.MINIFS(Data!C1:C100000, Data!B1:B100000, "West")
+=EPT.MAXIFS(Data!C1:C100000, Data!B1:B100000, "West")
+```
+
+```vba
+Dim total As Double
+total = Application.Run("EPT.SUMIFS", _
+        Worksheets("Data").Range("C1:C100000").Value, _
+        Worksheets("Data").Range("A1:A100000").Value, ">0", _
+        Worksheets("Data").Range("B1:B100000").Value, "West")
+```
+
+### Conditional aggregates Excel lacks natively
+
+```
+=EPT.MEDIANIFS(Data!C1:C100000, Data!B1:B100000, "West")
+=EPT.PERCENTILEIFS(Data!C1:C100000, 0.95, Data!B1:B100000, "West")
+=EPT.STDEVIFS(Data!C1:C100000, Data!B1:B100000, "West")
+=EPT.VARPIFS(Data!C1:C100000, Data!B1:B100000, "West")
+=EPT.MODEIFS(Data!C1:C100000, Data!B1:B100000, "West")
+=EPT.GEOMEANIFS(Data!C1:C100000, Data!B1:B100000, "West")
+=EPT.HARMEANIFS(Data!C1:C100000, Data!B1:B100000, "West")
+=EPT.PRODUCTIFS(Data!C1:C100000, Data!B1:B100000, "West")
+=EPT.DISTINCTCOUNTIFS(Data!C1:C100000, Data!B1:B100000, "West")
+=EPT.FIRSTIFS(Data!C1:C100000, Data!B1:B100000, "West")
+=EPT.LASTIFS(Data!C1:C100000, Data!B1:B100000, "West")
+```
+
+### Weighted statistics
+
+```
+=EPT.WAVG(Data!Price, Data!Qty)
+=EPT.WAVGIFS(Data!Price, Data!Qty, Data!Region, "West", Data!Year, 2025)
+=EPT.WMEDIAN(Data!Price, Data!Qty)
+=EPT.WSTDEV(Data!Price, Data!Qty)
+```
+
+```vba
+Dim w As Double
+w = Application.Run("EPT.WAVG", _
+        Worksheets("Data").Range("A1:A100000").Value, _
+        Worksheets("Data").Range("B1:B100000").Value)
+```
+
+### Conditional SUMPRODUCT
+
+```
+=EPT.SUMPRODUCTIFS(Data!Price, Data!Qty, Data!Region, "West")
+```
+
+### `EPT.GROUPBY(key_range, value_range, operation)`
+
+Returns a spilled table of distinct keys with one aggregate per group, in
+first-seen order. `key_range` may span several columns to form a composite
+key; the first column of `value_range` supplies the values. `operation` is
+one of `sum`, `count`, `average`, `min`, `max`, `median`, `stdev`, `stdevp`,
+`var`, `varp`, `product`, `mode`, `geomean`, `harmean`, `distinct`, `first`,
+`last`.
+
+```
+=EPT.GROUPBY(Sales!A2:A100000, Sales!D2:D100000, "sum")
+=EPT.GROUPBY(Sales!A2:B100000, Sales!D2:D100000, "average")
+```
+
+```vba
+Dim g As Variant
+g = Application.Run("EPT.GROUPBY", _
+        Worksheets("Sales").Range("A2:A100000").Value, _
+        Worksheets("Sales").Range("D2:D100000").Value, "sum")
+```
+
+## Boosted lookups
+
+### `EPT.XLOOKUPB(lookup_values, lookup_array, return_array, [if_not_found], [match_mode])`
+
+Resolves an entire column of lookup keys in one O(M+R) pass: the lookup
+column is indexed once, then probed for every key. The result mirrors the
+shape of `lookup_values`. Exact match (default) is case-insensitive; pass
+`FALSE` as `match_mode` for sorted-ascending approximate (next-smaller)
+match. Misses return `if_not_found` when supplied, otherwise `#N/A`.
+
+```
+=EPT.XLOOKUPB(A2:A100000, Table!A2:A100000, Table!E2:E100000)
+=EPT.XLOOKUPB(A2:A100000, Table!A2:A100000, Table!E2:E100000, "n/a")
+=EPT.XLOOKUPB(A2:A100000, Brackets!A2:A20, Brackets!B2:B20, "", FALSE)
+```
+
+```vba
+Dim res As Variant
+res = Application.Run("EPT.XLOOKUPB", _
+        Worksheets("Keys").Range("A2:A100000").Value, _
+        Worksheets("Table").Range("A2:A100000").Value, _
+        Worksheets("Table").Range("E2:E100000").Value)
+```
+
 ## Public .NET-only entry points
 
 These are not registered as UDFs because they take delegates,
