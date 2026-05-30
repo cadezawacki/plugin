@@ -88,6 +88,7 @@ ExcelPerfToolkit (single net8.0-windows class library, packed as XLL)
 ├── SeriesUtilities.cs       - Fill-forward, outliers, quantiles (#1, #2)
 ├── DateUtilities.cs         - WORKDAYADD (vectorized WORKDAY.INTL) (#1, #2)
 ├── DistanceUtilities.cs     - Pairwise distance matrices via SIMD dot products (#4)
+├── JsonUtilities.cs         - JSONPATH/PARSEJSON + async READ/WRITE JSON & NDJSON (#1, #2, #6)
 └── ToolkitLifetime.cs       - Shared shutdown CancellationTokenSource + TraceSource factory
 ```
 
@@ -317,6 +318,24 @@ surface as `#VALUE!` in that cell; invalid patterns return `#VALUE!`.
 | Function | Signature | Description |
 | --- | --- | --- |
 | `EPT.DISTANCE` | `(matrixA, [matrixB], [metric]) -> object[,]` | Pairwise distance matrix between row vectors. `euclidean` (default) and `cosine` route through the SIMD dot-product kernel; also `manhattan`, `chebyshev`. |
+
+### JSON (`JsonUtilities.cs`)
+
+Built on the in-box `System.Text.Json` (no third-party dependency). Path syntax is a
+documented subset: dotted keys and `[index]` steps with an optional leading `$`/`$.`
+(e.g. `data.items[0].name`). The two cell functions are MTR-safe; the three file functions
+are async and never open a workbook.
+
+| Function | Signature | MTR? | Description |
+| --- | --- | --- | --- |
+| `EPT.JSONPATH` | `(json, path) -> object[,]` | yes | Extract a value at `path` from the JSON in each cell. |
+| `EPT.PARSEJSON` | `(json, [path], [hasHeaderRow]) -> object[,]` | yes | Expand one JSON document into a spilled table. |
+| `EPT.READJSON` | `(path, [pointer], [hasHeaderRow]) -> object[,]` | no | Read a JSON file into a bulk array. |
+| `EPT.READNDJSON` | `(path, [hasHeaderRow]) -> object[,]` | no | Read newline-delimited JSON, streamed line by line. |
+| `EPT.WRITEJSON` | `(path, block, [hasHeaderRow], [indent]) -> double` | no | Write a block as a JSON array of objects/arrays; returns the record count. |
+
+Internal .NET-only async entry points: `JsonUtilities.ReadJsonAsync`,
+`ReadNdjsonAsync`, `WriteJsonAsync` (each takes a `CancellationToken`).
 
 ## Before and after: the one-crossing rule, demonstrated
 
@@ -575,6 +594,7 @@ sorted-ascending approximate match with a trailing `FALSE`.
 | `SeriesUtilities.cs` | **#1**/**#2** - directional fill, outlier flagging, and quantiles over a whole block. |
 | `DateUtilities.cs` | **#1**/**#2** - vectorized working-day arithmetic with custom weekends and holidays. |
 | `DistanceUtilities.cs` | **#4** - pairwise distance matrices expressed through the SIMD dot-product kernel. |
+| `JsonUtilities.cs` | **#1**/**#2** (in-grid JSON extraction) and **#6** (async file read/write that never opens a workbook), on the in-box `System.Text.Json`. |
 | `ToolkitLifetime.cs` | Shared shutdown `CancellationTokenSource` and `TraceSource` factory used by the second-wave files. |
 
 ## See also

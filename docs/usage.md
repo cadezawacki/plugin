@@ -725,6 +725,45 @@ returns the full distance matrix. Omit `matrix_b` to compare `matrix_a` to itsel
 m = Application.Run("EPT.DISTANCE", a, b, "euclidean")
 ```
 
+## JSON
+
+Built on the in-box `System.Text.Json`. `EPT.JSONPATH` and `EPT.PARSEJSON` are MTR-safe
+and operate on JSON text already in the grid; `EPT.READJSON`/`EPT.READNDJSON`/`EPT.WRITEJSON`
+are async file functions that never open a workbook. Path syntax is dotted keys plus
+`[index]` with an optional leading `$`/`$.`.
+
+### `EPT.JSONPATH(json, path)` and `EPT.PARSEJSON(json, [path], [hasHeaderRow])`
+
+```
+=EPT.JSONPATH(A1:A1000, "address.city")
+=EPT.JSONPATH(A1:A1000, "items[0].sku")
+=EPT.PARSEJSON(A1)                          ' expand a document to a table
+=EPT.PARSEJSON(A1, "data.rows")             ' expand a sub-node
+=EPT.PARSEJSON(A1, "", FALSE)               ' no header row
+```
+
+```vba
+city = Application.Run("EPT.JSONPATH", arr, "address.city")
+tbl = Application.Run("EPT.PARSEJSON", jsonText, "data.rows")
+```
+
+### `EPT.READJSON` / `EPT.READNDJSON` / `EPT.WRITEJSON`
+
+```
+=EPT.READJSON("C:\data\orders.json")
+=EPT.READJSON("C:\data\payload.json", "data.orders")
+=EPT.READNDJSON("C:\data\events.ndjson")
+=EPT.WRITEJSON("C:\out\rows.json", Data!A1:D1000)        ' array of objects (row 1 = keys)
+=EPT.WRITEJSON("C:\out\rows.json", Data!A1:D1000, FALSE, TRUE)  ' arrays, pretty-printed
+```
+
+```vba
+arr = Application.Run("EPT.READJSON", "C:\data\orders.json")
+Worksheets("Data").Range("A1").Resize(UBound(arr, 1), UBound(arr, 2)).Value = arr
+n = Application.Run("EPT.WRITEJSON", "C:\out\rows.json", _
+                    Worksheets("Data").Range("A1:D1000").Value)
+```
+
 ## Public .NET-only entry points
 
 These are not registered as UDFs because they take delegates,
