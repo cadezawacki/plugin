@@ -764,6 +764,48 @@ n = Application.Run("EPT.WRITEJSON", "C:\out\rows.json", _
                     Worksheets("Data").Range("A1:D1000").Value)
 ```
 
+## Filesystem
+
+`EPT.FILEINFO` and `EPT.READFOLDER` work directly against the filesystem (no workbook
+open). `EPT.WATCHFILE`/`EPT.WATCHFOLDER` are live RTD triggers.
+
+```
+=EPT.FILEINFO("C:\data\prices.csv")
+=EPT.FILEINFO(A1:A20)                          ' metadata for a column of paths
+=EPT.READFOLDER("C:\data", "*.csv")            ' concatenate, align by header
+=EPT.READFOLDER("C:\data", "*.json", TRUE)     ' recurse subfolders
+=EPT.WATCHFILE("C:\data\prices.csv")           ' increments when the file changes
+=EPT.WATCHFOLDER("C:\data")                     ' increments on any change in the folder
+```
+
+A common pattern: make an import depend on the watch trigger so it re-runs on change.
+
+```
+=IF(EPT.WATCHFILE("C:\data\prices.csv")>=0, EPT.READCSV("C:\data\prices.csv"), "")
+```
+
+## Result caching
+
+`EPT.MEMOIZE`/`EPT.CACHE.*` are an in-memory session cache; `EPT.DISKCACHE.*` persists
+across reopen. Build keys from input content with `EPT.HASHBLOCK`. (Excel computes a UDF's
+arguments first, so these store and reuse results - they do not stop the inner formula from
+computing once.)
+
+```
+=EPT.MEMOIZE("prices_v1", EPT.READCSV("C:\data\prices.csv"))
+=EPT.CACHE.GET("prices_v1")
+=EPT.CACHE.GET("missing", "n/a")
+=EPT.CACHE.CLEAR()                              ' clear everything; returns count
+=EPT.DISKCACHE.WRITE("daily_"&TODAY(), Data!A1:Z1000)
+=EPT.DISKCACHE.READ("daily_"&TODAY())
+=EPT.DISKCACHE.CLEAR("daily_"&TODAY())
+```
+
+```vba
+Application.Run "EPT.DISKCACHE.WRITE", "snapshot", Worksheets("Data").Range("A1:Z1000").Value
+arr = Application.Run("EPT.DISKCACHE.READ", "snapshot")
+```
+
 ## Public .NET-only entry points
 
 These are not registered as UDFs because they take delegates,

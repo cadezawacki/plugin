@@ -89,6 +89,9 @@ ExcelPerfToolkit (single net8.0-windows class library, packed as XLL)
 ├── DateUtilities.cs         - WORKDAYADD (vectorized WORKDAY.INTL) (#1, #2)
 ├── DistanceUtilities.cs     - Pairwise distance matrices via SIMD dot products (#4)
 ├── JsonUtilities.cs         - JSONPATH/PARSEJSON + async READ/WRITE JSON & NDJSON (#1, #2, #6)
+├── FileSystemUtilities.cs   - FILEINFO, READFOLDER, WATCHFILE/WATCHFOLDER (#6)
+├── WatchFeeds.cs            - FileSystemWatcher-backed RTD feeds for the watch UDFs (#5, #6)
+├── CacheUtilities.cs        - Session cache (MEMOIZE/CACHE.*) + disk cache (DISKCACHE.*)
 └── ToolkitLifetime.cs       - Shared shutdown CancellationTokenSource + TraceSource factory
 ```
 
@@ -336,6 +339,33 @@ are async and never open a workbook.
 
 Internal .NET-only async entry points: `JsonUtilities.ReadJsonAsync`,
 `ReadNdjsonAsync`, `WriteJsonAsync` (each takes a `CancellationToken`).
+
+### Filesystem (`FileSystemUtilities.cs`, `WatchFeeds.cs`)
+
+| Function | Signature | MTR? | Description |
+| --- | --- | --- | --- |
+| `EPT.FILEINFO` | `(paths) -> object[,]` | no | Metadata table: `Path, Exists, IsDirectory, SizeBytes, Modified, Created, Extension, Name`. |
+| `EPT.READFOLDER` | `(folder, [pattern], [recursive], [hasHeaderRow]) -> object[,]` | no | Read & concatenate matching files (CSV/TSV/JSON/NDJSON), aligning columns by header. |
+| `EPT.WATCHFILE` | `(path) -> double` | yes | Live RTD change counter for a file - a recalculation trigger. |
+| `EPT.WATCHFOLDER` | `(path) -> double` | yes | Live RTD change counter for a folder (non-recursive). |
+
+`WATCHFILE`/`WATCHFOLDER` plug `FileSystemWatcher`-backed feeds into the existing RTD
+server; bursts of events are coalesced by the server's 250 ms throttle.
+
+### Result caching (`CacheUtilities.cs`)
+
+Stateful, so registered `IsThreadSafe = false`. Build content-addressed keys with the
+existing `EPT.HASHBLOCK`. Note Excel evaluates arguments before calling a UDF, so these
+store/return results for reuse - they do not prevent the inner formula from computing once.
+
+| Function | Signature | Description |
+| --- | --- | --- |
+| `EPT.MEMOIZE` | `(key, value) -> value` | Store a value in the session cache and return it (pass-through). |
+| `EPT.CACHE.GET` | `(key, [ifMissing]) -> object` | Read from the session cache. |
+| `EPT.CACHE.CLEAR` | `([key]) -> double` | Clear one key or all; returns count removed. |
+| `EPT.DISKCACHE.WRITE` | `(key, block) -> double` | Persist a block (survives reopen); returns row count. |
+| `EPT.DISKCACHE.READ` | `(key, [ifMissing]) -> object` | Load a persisted block. |
+| `EPT.DISKCACHE.CLEAR` | `([key]) -> double` | Delete one key or all; returns count removed. |
 
 ## Before and after: the one-crossing rule, demonstrated
 
@@ -595,6 +625,9 @@ sorted-ascending approximate match with a trailing `FALSE`.
 | `DateUtilities.cs` | **#1**/**#2** - vectorized working-day arithmetic with custom weekends and holidays. |
 | `DistanceUtilities.cs` | **#4** - pairwise distance matrices expressed through the SIMD dot-product kernel. |
 | `JsonUtilities.cs` | **#1**/**#2** (in-grid JSON extraction) and **#6** (async file read/write that never opens a workbook), on the in-box `System.Text.Json`. |
+| `FileSystemUtilities.cs` | **#6** - file metadata and folder ingest direct from `System.IO`; watch UDFs trigger recalcs from disk events. |
+| `WatchFeeds.cs` | **#5**/**#6** - `FileSystemWatcher` feeds for `WATCHFILE`/`WATCHFOLDER`, throttled through the RTD server. |
+| `CacheUtilities.cs` | Session and disk result caches so expensive blocks are stored once and reused across cells and sessions. |
 | `ToolkitLifetime.cs` | Shared shutdown `CancellationTokenSource` and `TraceSource` factory used by the second-wave files. |
 
 ## See also
