@@ -632,6 +632,99 @@ res = Application.Run("EPT.XLOOKUPB", _
         Worksheets("Table").Range("E2:E100000").Value)
 ```
 
+## Text utilities (MTR-eligible)
+
+All `EPT.*` text functions are `IsThreadSafe = true`, whole-block, one-crossing. Case
+functions leave non-string cells untouched; pad/repeat/reverse pass blanks and errors
+through.
+
+```
+=EPT.PROPER(Data!A1:A1000)
+=EPT.TITLECASE(Data!A1:A1000)
+=EPT.CAMELCASE(Data!A1:A1000)
+=EPT.PADLEFT(Data!A1:A1000, 10)
+=EPT.PADRIGHT(Data!A1:A1000, 10, ".")
+=EPT.ZEROPAD(Data!A1:A1000, 6)
+=EPT.REPEAT(Data!A1:A1000, 3)
+=EPT.REVERSE(Data!A1:A1000)
+```
+
+`EPT.TEMPLATEFILL(template, data, [has_header_row])` renders a template once per data
+row. Placeholders are `{HeaderName}` (when a header row is present) or `{0}`-style column
+indexes; use `{{`/`}}` for literal braces.
+
+```
+=EPT.TEMPLATEFILL("Dear {Name}, your balance is {Amount}.", Data!A1:B100)
+=EPT.TEMPLATEFILL("{0}-{1}", Data!A2:B100, FALSE)
+```
+
+```vba
+arr = Application.Run("EPT.TEMPLATEFILL", "Hi {Name}", Worksheets("Data").Range("A1:A100").Value)
+```
+
+## Regex utilities (MTR-eligible)
+
+Pattern is compiled once per call with a 1-second match timeout. `ignore_case` defaults to
+FALSE. `EPT.REGEXEXTRACTALL` and `EPT.REGEXSPLIT` require a single-column input and spill
+across columns.
+
+```
+=EPT.REGEXMATCH(Data!A1:A1000, "^[A-Z]{2}\d+$")
+=EPT.REGEXCOUNT(Data!A1:A1000, "\d")
+=EPT.REGEXEXTRACT(Data!A1:A1000, "(\d{4})-(\d{2})", 1)
+=EPT.REGEXEXTRACTALL(Data!A1:A1000, "\d+")
+=EPT.REGEXSPLIT(Data!A1:A1000, "\s*,\s*")
+```
+
+```vba
+arr = Application.Run("EPT.REGEXEXTRACT", arr, "[0-9]+", 0, False)
+```
+
+## Series cleaning & robust stats (MTR-eligible)
+
+```
+=EPT.FILLFORWARD(Data!A1:D1000)            ' down (default)
+=EPT.FILLFORWARD(Data!A1:D1000, "right")
+=EPT.OUTLIERS(Data!A1:A1000)               ' iqr, 1.5x fences
+=EPT.OUTLIERS(Data!A1:A1000, "zscore", 2.5)
+=EPT.QUANTILES(Data!A1:A1000, {0;0.25;0.5;0.75;1})
+```
+
+```vba
+flags = Application.Run("EPT.OUTLIERS", arr, "mad", 3)
+```
+
+## Working-day arithmetic
+
+`EPT.WORKDAYADD(start_dates, days, [weekend_mask], [holidays])` adds working days using a
+7-character `Mon..Sun` weekend mask (`'1'` = non-working, default `"0000011"`). `start_dates`
+and `days` may each be a scalar or a block (a scalar is broadcast).
+
+```
+=EPT.WORKDAYADD(A2, 10)
+=EPT.WORKDAYADD(A2:A100, 5, "0000011", Holidays!A1:A20)
+=EPT.WORKDAYADD(A2, -3, "1000001")        ' Monday & Sunday as weekend
+```
+
+```vba
+serial = Application.Run("EPT.WORKDAYADD", DateSerial(2026, 1, 2), 10)
+```
+
+## Pairwise distance
+
+`EPT.DISTANCE(matrix_a, [matrix_b], [metric])` treats each row as an observation vector and
+returns the full distance matrix. Omit `matrix_b` to compare `matrix_a` to itself.
+
+```
+=EPT.DISTANCE(Data!A2:E50)                 ' 49x49 euclidean self-distances
+=EPT.DISTANCE(Data!A2:E50, Centroids!A2:E5, "cosine")
+=EPT.DISTANCE(Data!A2:E50, Data!A2:E50, "manhattan")
+```
+
+```vba
+m = Application.Run("EPT.DISTANCE", a, b, "euclidean")
+```
+
 ## Public .NET-only entry points
 
 These are not registered as UDFs because they take delegates,

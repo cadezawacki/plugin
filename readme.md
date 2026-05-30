@@ -83,6 +83,11 @@ ExcelPerfToolkit (single net8.0-windows class library, packed as XLL)
 ├── DirectFileIO.cs          - Async CSV/TSV streaming, no object model (#6)
 ├── ConditionalAggregates.cs - *IFS family, weighted stats, SUMPRODUCTIFS, GROUPBY (#7)
 ├── LookupBoost.cs           - Batched exact/approximate lookup, O(M+R) (#8)
+├── TextUtilities.cs         - Case/pad/repeat/reverse/templatefill over blocks (#1, #2)
+├── RegexUtilities.cs        - Match/count/extract/extractall/split over blocks (#1, #2)
+├── SeriesUtilities.cs       - Fill-forward, outliers, quantiles (#1, #2)
+├── DateUtilities.cs         - WORKDAYADD (vectorized WORKDAY.INTL) (#1, #2)
+├── DistanceUtilities.cs     - Pairwise distance matrices via SIMD dot products (#4)
 └── ToolkitLifetime.cs       - Shared shutdown CancellationTokenSource + TraceSource factory
 ```
 
@@ -263,6 +268,55 @@ composite key.
 | Function | Signature | Description |
 | --- | --- | --- |
 | `EPT.XLOOKUPB` | `(lookupValues, lookupArray, returnArray, [ifNotFound], [matchMode]) -> object[,]` | Resolve a whole column of keys in one O(M+R) pass. Exact (hash) by default; `matchMode = FALSE` does sorted-ascending approximate (next-smaller) match. Result mirrors `lookupValues`' shape; misses return `ifNotFound` or `#N/A`. **`IsThreadSafe = true`.** |
+
+### Text utilities (`TextUtilities.cs`)
+
+All MTR-safe, whole-block, one-crossing. Case functions pass non-string cells through;
+pad/repeat/reverse pass blanks and errors through.
+
+| Function | Signature | Description |
+| --- | --- | --- |
+| `EPT.PROPER` | `(block) -> object[,]` | Proper-case each word (first upper, rest lower). |
+| `EPT.TITLECASE` | `(block) -> object[,]` | Title-case, preserving all-caps acronyms. |
+| `EPT.CAMELCASE` | `(block) -> object[,]` | `camelCase`, dropping separators. |
+| `EPT.PADLEFT` / `EPT.PADRIGHT` | `(block, totalWidth, [padChar]) -> object[,]` | Pad each cell's text to a width. |
+| `EPT.ZEROPAD` | `(block, totalWidth) -> object[,]` | Left-pad with `0` to a width. |
+| `EPT.REPEAT` | `(block, count) -> object[,]` | Repeat each cell's text N times. |
+| `EPT.REVERSE` | `(block) -> object[,]` | Reverse each cell's characters. |
+| `EPT.TEMPLATEFILL` | `(template, data, [hasHeaderRow]) -> object[,]` | Mail-merge: render `{name}`/`{index}` placeholders once per data row. |
+
+### Regex utilities (`RegexUtilities.cs`)
+
+Pattern compiled once per call with a 1s match timeout (ReDoS-safe). Per-cell timeouts
+surface as `#VALUE!` in that cell; invalid patterns return `#VALUE!`.
+
+| Function | Signature | Description |
+| --- | --- | --- |
+| `EPT.REGEXMATCH` | `(block, pattern, [ignoreCase]) -> object[,]` | TRUE/FALSE per cell. |
+| `EPT.REGEXCOUNT` | `(block, pattern, [ignoreCase]) -> object[,]` | Count of matches per cell. |
+| `EPT.REGEXEXTRACT` | `(block, pattern, [groupIndex], [ignoreCase]) -> object[,]` | First match (or capture group) per cell. |
+| `EPT.REGEXEXTRACTALL` | `(column, pattern, [groupIndex], [ignoreCase]) -> object[,]` | All matches per row of a single column, spilled across columns. |
+| `EPT.REGEXSPLIT` | `(column, pattern, [ignoreCase]) -> object[,]` | Split each cell of a single column by a regex, spilled across columns. |
+
+### Series & robust stats (`SeriesUtilities.cs`)
+
+| Function | Signature | Description |
+| --- | --- | --- |
+| `EPT.FILLFORWARD` | `(block, [direction]) -> object[,]` | Fill blanks from the previous value `down`/`up`/`right`/`left`. |
+| `EPT.OUTLIERS` | `(block, [method], [threshold]) -> object[,]` | TRUE/FALSE outlier flags via `iqr`/`zscore`/`mad`. |
+| `EPT.QUANTILES` | `(block, probabilities) -> object[,]` | Inclusive quantiles for each requested probability. |
+
+### Dates (`DateUtilities.cs`)
+
+| Function | Signature | Description |
+| --- | --- | --- |
+| `EPT.WORKDAYADD` | `(startDates, days, [weekendMask], [holidays]) -> object` | Add working days with a 7-char `Mon..Sun` weekend mask and holiday list; scalar or block, broadcast. |
+
+### Distance (`DistanceUtilities.cs`)
+
+| Function | Signature | Description |
+| --- | --- | --- |
+| `EPT.DISTANCE` | `(matrixA, [matrixB], [metric]) -> object[,]` | Pairwise distance matrix between row vectors. `euclidean` (default) and `cosine` route through the SIMD dot-product kernel; also `manhattan`, `chebyshev`. |
 
 ## Before and after: the one-crossing rule, demonstrated
 
@@ -516,6 +570,11 @@ sorted-ascending approximate match with a trailing `FALSE`.
 | `DirectFileIO.cs` | **#6** (file I/O via the object model) - async streaming CSV/TSV through managed file streams, no workbook ever opened. |
 | `ConditionalAggregates.cs` | **#7** (conditional functions re-scan per formula) - one-pass match mask over bulk blocks, MTR-safe, plus the conditional aggregates and weighted statistics Excel lacks natively. |
 | `LookupBoost.cs` | **#8** (lookups re-scan the table per formula) - build the table index once, probe it for a whole column of lookup values in O(M+R). |
+| `TextUtilities.cs` | **#1**/**#2** - whole-block case, padding, repeat, reverse, and templated fill in pure managed memory. |
+| `RegexUtilities.cs` | **#1**/**#2** - block-wide regex match/count/extract/split with a per-cell ReDoS timeout. |
+| `SeriesUtilities.cs` | **#1**/**#2** - directional fill, outlier flagging, and quantiles over a whole block. |
+| `DateUtilities.cs` | **#1**/**#2** - vectorized working-day arithmetic with custom weekends and holidays. |
+| `DistanceUtilities.cs` | **#4** - pairwise distance matrices expressed through the SIMD dot-product kernel. |
 | `ToolkitLifetime.cs` | Shared shutdown `CancellationTokenSource` and `TraceSource` factory used by the second-wave files. |
 
 ## See also
