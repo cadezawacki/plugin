@@ -488,6 +488,169 @@ public static class ConditionalAggregates
         });
 
     // ====================================================================
+    // Vectorized CASE WHEN + conditional text join
+    // ====================================================================
+
+    /// <summary>Excel's hard limit on the number of characters a single cell can hold.</summary>
+    private const int MaxCellChars = 32_767;
+
+    /// <summary>
+    /// Vectorized <c>CASE WHEN</c> over a whole block - the one-call replacement for nested
+    /// <c>IF</c>/<c>IFS</c>/<c>SWITCH</c> chains. Each cell of <paramref name="testRange"/>
+    /// is evaluated against the (criteria, result) pairs in order and receives the result of
+    /// the FIRST matching criterion. Criteria use the same Excel grammar as the *IFS family
+    /// (<c>"&gt;=5"</c>, <c>"&lt;&gt;x"</c>, wildcards, blank forms, bare values) and each is
+    /// parsed ONCE per call - not once per cell, as a column of nested IFs effectively does.
+    /// Each result may be a scalar (broadcast) or a block shaped like the test range
+    /// (per-cell). A trailing unpaired argument is the default for unmatched cells; without
+    /// one they return <c>#N/A</c>, as native <c>SWITCH</c> does.
+    /// Marshaling cost: one read per range argument; one bulk write.
+    /// Thread-safety: SAFE for MTR.
+    /// </summary>
+    [ExcelFunction(
+        Name = "EPT.CASEWHEN",
+        Description = "Vectorized CASE WHEN: first matching (criteria, result) pair per cell; trailing unpaired value is the default.",
+        Category = "EPT.Conditional",
+        IsThreadSafe = true,
+        IsVolatile = false)]
+    public static object CaseWhen(
+        [ExcelArgument(Name = "test_range", Description = "Values to test. Result mirrors this shape.")] object testRange,
+        [ExcelArgument(Name = "criteria1", Description = "First criterion (Excel criteria grammar).")] object criteria1,
+        [ExcelArgument(Name = "result1", Description = "Result when criteria1 matches; scalar or same-shaped block.")] object result1,
+        [ExcelArgument(Name = "more", Description = "Additional criteria, result pairs; a trailing unpaired value is the default.")] params object[] more)
+        => Guard("EPT.CASEWHEN", () =>
+        {
+            var block = Marshaling.AsArray2D(testRange);
+            var rows = block.GetLength(0);
+            var cols = block.GetLength(1);
+
+            var pairCount = 1 + (more.Length / 2);
+            var criteria = new Criterion[pairCount];
+            var results = new Func<int, int, object>[pairCount];
+            criteria[0] = Criterion.Parse(criteria1);
+            results[0] = ResultProvider(result1, rows, cols);
+            for (var p = 1; p < pairCount; p++)
+            {
+                criteria[p] = Criterion.Parse(more[2 * (p - 1)]);
+                results[p] = ResultProvider(more[(2 * (p - 1)) + 1], rows, cols);
+            }
+            Func<int, int, object> fallback = more.Length % 2 == 1
+                ? ResultProvider(more[^1], rows, cols)
+                : static (_, _) => ExcelError.ExcelErrorNA;
+
+            var result = new object[rows, cols];
+            for (var r = 0; r < rows; r++)
+            {
+                for (var c = 0; c < cols; c++)
+                {
+                    var cell = block[r, c];
+                    var matched = false;
+                    for (var p = 0; p < pairCount; p++)
+                    {
+                        if (criteria[p].Matches(cell))
+                        {
+                            result[r, c] = results[p](r, c);
+                            matched = true;
+                            break;
+                        }
+                    }
+                    if (!matched)
+                    {
+                        result[r, c] = fallback(r, c);
+                    }
+                }
+            }
+            return result;
+        });
+
+    /// <summary>
+    /// Joins the text of the cells matching every criterion - the conditional
+    /// <c>TEXTJOIN</c> Excel lacks natively (the workaround is a <c>TEXTJOIN(IF(...))</c>
+    /// array formula that re-scans per cell). Blank matched cells are skipped; an error in
+    /// a matched cell propagates, as native <c>TEXTJOIN</c> does; a result beyond the
+    /// 32,767-character cell limit returns <c>#VALUE!</c>.
+    /// Marshaling cost: one read per range argument; one scalar write.
+    /// Thread-safety: SAFE for MTR.
+    /// </summary>
+    [ExcelFunction(
+        Name = "EPT.TEXTJOINIFS",
+        Description = "Join the text of cells matching every (range, criteria) pair (no native equivalent).",
+        Category = "EPT.Conditional",
+        IsThreadSafe = true,
+        IsVolatile = false)]
+    public static object TextJoinIfs(
+        [ExcelArgument(Name = "text_range", Description = "Cells whose text is joined.")] object textRange,
+        [ExcelArgument(Name = "delimiter")] string delimiter,
+        [ExcelArgument(Name = "criteria_range1")] object criteriaRange1,
+        [ExcelArgument(Name = "criteria1")] object criteria1,
+        [ExcelArgument(Name = "more")] params object[] morePairs)
+        => Guard("EPT.TEXTJOINIFS", () =>
+        {
+            var values = Marshaling.AsArray2D(textRange);
+            var rows = values.GetLength(0);
+            var cols = values.GetLength(1);
+            var mask = BuildMask(rows, cols, Combine(criteriaRange1, criteria1, morePairs));
+            delimiter ??= string.Empty;
+            var sb = new StringBuilder();
+            var first = true;
+            var i = 0;
+            for (var r = 0; r < rows; r++)
+            {
+                for (var c = 0; c < cols; c++, i++)
+                {
+                    if (!mask[i])
+                    {
+                        continue;
+                    }
+                    var cell = values[r, c];
+                    if (cell is ExcelError err)
+                    {
+                        return err;
+                    }
+                    if (IsBlank(cell))
+                    {
+                        continue;
+                    }
+                    if (!first)
+                    {
+                        sb.Append(delimiter);
+                    }
+                    sb.Append(Marshaling.ToStringSafe(cell));
+                    first = false;
+                    if (sb.Length > MaxCellChars)
+                    {
+                        return ExcelError.ExcelErrorValue;
+                    }
+                }
+            }
+            return sb.ToString();
+        });
+
+    /// <summary>
+    /// Adapts a CASE WHEN result argument into a per-cell accessor: a 1x1 block or scalar
+    /// broadcasts; a block matching the test range's shape supplies per-cell values; any
+    /// other shape is rejected.
+    /// </summary>
+    private static Func<int, int, object> ResultProvider(object arg, int rows, int cols)
+    {
+        if (arg is object[,] b)
+        {
+            if (b.Length == 1)
+            {
+                var single = b[0, 0] ?? ExcelEmpty.Value;
+                return (_, _) => single;
+            }
+            if (b.GetLength(0) == rows && b.GetLength(1) == cols)
+            {
+                return (r, c) => b[r, c] ?? ExcelEmpty.Value;
+            }
+            throw new ArgumentException($"A result block must be a scalar or match the test range's {rows}x{cols} shape.");
+        }
+        var value = arg is null or ExcelMissing ? ExcelEmpty.Value : arg;
+        return (_, _) => value;
+    }
+
+    // ====================================================================
     // Shared aggregation engine
     // ====================================================================
 

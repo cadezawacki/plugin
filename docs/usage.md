@@ -608,6 +608,33 @@ g = Application.Run("EPT.GROUPBY", _
         Worksheets("Sales").Range("D2:D100000").Value, "sum")
 ```
 
+### `EPT.CASEWHEN(test_range, criteria1, result1, ..., [default])`
+
+Vectorized CASE WHEN: each cell of `test_range` gets the result of the first
+matching criterion - the one-call replacement for nested `IF`/`IFS`/`SWITCH`
+chains. Criteria use the same grammar as the `*IFS` family and are parsed once
+per call. Results may be scalars (broadcast) or blocks shaped like the test
+range; a trailing unpaired argument is the default, otherwise unmatched cells
+return `#N/A` like native `SWITCH`.
+
+```
+=EPT.CASEWHEN(Data!A1:A100000, ">=90", "A", ">=80", "B", ">=70", "C", "F")
+=EPT.CASEWHEN(Data!B1:B100000, "<0", Data!C1:C100000, ">0", "positive", "zero")
+```
+
+```vba
+grades = Application.Run("EPT.CASEWHEN", scores, ">=90", "A", ">=80", "B", "F")
+```
+
+### `EPT.TEXTJOINIFS(text_range, delimiter, criteria_range1, criteria1, ...)`
+
+Conditional TEXTJOIN - the clean, fast form of the `TEXTJOIN(IF(...))` array
+idiom. Blank matched cells are skipped; an error in a matched cell propagates.
+
+```
+=EPT.TEXTJOINIFS(Sales!B2:B100000, ", ", Sales!A2:A100000, "West")
+```
+
 ## Boosted lookups
 
 ### `EPT.XLOOKUPB(lookup_values, lookup_array, return_array, [if_not_found], [match_mode])`
@@ -632,6 +659,41 @@ res = Application.Run("EPT.XLOOKUPB", _
         Worksheets("Table").Range("E2:E100000").Value)
 ```
 
+### `EPT.VLOOKUPB(lookup_values, table, col_index, [if_not_found], [range_lookup])`
+
+Batched VLOOKUP: keys are matched against the table's **first** column;
+`col_index` is 1-based and may list several columns (one output column per
+index), so one call replaces a whole bank of VLOOKUP columns. `range_lookup`
+mirrors native VLOOKUP - omitted/`TRUE` = approximate, `FALSE` = exact - the
+**opposite** default of `EPT.XLOOKUPB`, exactly as the native pair disagrees.
+
+```
+=EPT.VLOOKUPB(A2:A100000, Table!A2:E100000, 5, , FALSE)
+=EPT.VLOOKUPB(A2:A100000, Table!A2:E100000, {2,3,5}, "n/a", FALSE)
+=EPT.VLOOKUPB(A2:A100000, Brackets!A2:B20, 2)
+```
+
+```vba
+res = Application.Run("EPT.VLOOKUPB", keys, _
+        Worksheets("Table").Range("A2:E100000").Value, Array(2, 5), "", False)
+```
+
+### `EPT.MAPVALUES(block, old_values, new_values, [if_missing])`
+
+Recode a block through an old → new value map in one hashed pass - the batch
+replacement for nested IF/SWITCH chains that merely relabel values. Unmapped
+cells pass through unchanged unless `if_missing` is supplied; error cells
+always pass through.
+
+```
+=EPT.MAPVALUES(Data!A1:A100000, Codes!A1:A50, Codes!B1:B50)
+=EPT.MAPVALUES(Data!A1:A100000, Codes!A1:A50, Codes!B1:B50, "unknown")
+```
+
+```vba
+recoded = Application.Run("EPT.MAPVALUES", arr, oldVals, newVals)
+```
+
 ## Text utilities (MTR-eligible)
 
 All `EPT.*` text functions are `IsThreadSafe = true`, whole-block, one-crossing. Case
@@ -647,6 +709,24 @@ through.
 =EPT.ZEROPAD(Data!A1:A1000, 6)
 =EPT.REPEAT(Data!A1:A1000, 3)
 =EPT.REVERSE(Data!A1:A1000)
+```
+
+`EPT.SUBSTITUTE(block, old_text, new_text, [instance_num])` is the native
+SUBSTITUTE over a whole block: case-sensitive, replaces all occurrences (or
+only the Nth when `instance_num` is supplied). Untouched cells pass through,
+so numerics stay numeric. `EPT.SUBSTITUTEALL(block, find_values,
+replace_values)` applies an entire find/replace pair table per cell in one
+pass - the replacement for `SUBSTITUTE(SUBSTITUTE(SUBSTITUTE(...)))` chains;
+pairs apply in order, exactly like the nested chain.
+
+```
+=EPT.SUBSTITUTE(Data!A1:A100000, "N/A", "")
+=EPT.SUBSTITUTE(Data!A1:A100000, "-", "/", 1)
+=EPT.SUBSTITUTEALL(Data!A1:A100000, Fixes!A1:A20, Fixes!B1:B20)
+```
+
+```vba
+arr = Application.Run("EPT.SUBSTITUTEALL", arr, findVals, replaceVals)
 ```
 
 `EPT.TEMPLATEFILL(template, data, [has_header_row])` renders a template once per data
@@ -692,6 +772,41 @@ arr = Application.Run("EPT.REGEXEXTRACT", arr, "[0-9]+", 0, False)
 
 ```vba
 flags = Application.Run("EPT.OUTLIERS", arr, "mad", 3)
+```
+
+### Running, moving, and rank aggregates
+
+`EPT.RUNNINGAGG(block, operation)` produces the cumulative
+`sum|count|average|min|max|product` down each column in one O(N) pass -
+replacing the `=SUM($A$1:A1)` expanding-range pattern, which is O(N²) and
+recomputed on every edit. `EPT.MOVINGAGG(block, window, operation,
+[min_periods])` is the trailing-window
+`sum|average|count|min|max|median|stdev` - the non-volatile replacement for
+`AVERAGE(OFFSET(...))` windows; cells whose window holds fewer than
+`min_periods` numeric values (default: the window size) stay blank.
+
+```
+=EPT.RUNNINGAGG(Data!A1:A100000, "sum")
+=EPT.MOVINGAGG(Data!A1:A100000, 20, "average")
+=EPT.MOVINGAGG(Data!A1:A100000, 20, "stdev", 5)
+```
+
+`EPT.RANKB(block, [order], [ties])` ranks every numeric cell against the
+whole block in one O(N log N) pass (a column of native RANK formulas is
+O(N²)). `order` follows native RANK: 0/omitted = descending. `ties` is `eq`
+(default, RANK.EQ), `avg` (RANK.AVG), `dense` (no gaps - no native
+equivalent), or `ordinal`. `EPT.PERCENTRANKB(block, [significance])` is the
+batched PERCENTRANK.INC.
+
+```
+=EPT.RANKB(Data!A1:A100000)
+=EPT.RANKB(Data!A1:A100000, 1, "dense")
+=EPT.PERCENTRANKB(Data!A1:A100000)
+```
+
+```vba
+ranks = Application.Run("EPT.RANKB", arr, 0, "avg")
+totals = Application.Run("EPT.RUNNINGAGG", arr, "sum")
 ```
 
 ## Working-day arithmetic
@@ -841,3 +956,43 @@ End Sub
 ```
 
 Two crossings total, regardless of how many cells are involved.
+
+## VBA convenience module: `vba/EptToolkit.bas`
+
+The pattern above - and the standard fast-mode/event scaffolding around it -
+is packaged as a drop-in module. Import it via **VBE → File → Import
+File...**, then:
+
+```vba
+' Auto-optimization at open/close: paste into ThisWorkbook.
+Private Sub Workbook_Open()
+    EptAutoOptimizeOpen        ' MTR on, animations off, XLL warmed
+End Sub
+Private Sub Workbook_BeforeClose(Cancel As Boolean)
+    EptAutoOptimizeClose       ' EPT session cache cleared, UI restored
+End Sub
+```
+
+```vba
+Sub Examples()
+    ' Nesting-safe suspension of screen/calc/events around any macro.
+    EptFastModeBegin
+    On Error GoTo Cleanup
+
+    ' Two-crossing transform of a range through any EPT block function.
+    EptTransformRange Range("A1:A100000"), "EPT.TRIMBLOCK"
+    EptTransformRange Range("A1:A100000"), "EPT.SUBSTITUTE", "N/A", ""
+
+    ' The common use cases as one-liners.
+    EptCleanRange Range("A1:D100000")                          ' trim + coerce numerics
+    EptVLookupFast Range("A2:A100000"), Range("Tbl!A2:E99"), 5, Range("B2")
+    EptSubstituteAll Range("A1:A100000"), Range("Fix!A1:A20"), Range("Fix!B1:B20")
+    EptGroupBy Range("A2:A100000"), Range("D2:D100000"), "sum", Range("G1")
+    EptRunningTotals Range("D2:D100000"), Range("E2")
+    EptImportCsv "C:\data\prices.csv", Range("Import!A1")
+    EptExportCsv Range("A1:D100000"), "C:\data\out.csv"
+
+Cleanup:
+    EptFastModeEnd
+End Sub
+```

@@ -95,6 +95,252 @@ public static class LookupBoost
         }
     }
 
+    /// <summary>
+    /// Batched <c>VLOOKUP</c>: resolves every cell of <paramref name="lookupValues"/>
+    /// against the FIRST column of <paramref name="table"/> in one pass and returns the
+    /// value(s) at <paramref name="colIndex"/> (1-based, counted from the table's first
+    /// column). <paramref name="colIndex"/> may be a single index or a row/column of
+    /// indexes - one output column per index - so one call replaces an entire bank of
+    /// VLOOKUP columns. Lookup values are read row-major; the result has one row per
+    /// lookup value and one column per requested index.
+    ///
+    /// <para><paramref name="rangeLookup"/> mirrors native <c>VLOOKUP</c>: omitted or
+    /// <c>TRUE</c> = approximate (next-smaller over the numeric keys, sorted internally if
+    /// needed); <c>FALSE</c> or <c>0</c> = exact (hash index, type-aware: numeric 5 never
+    /// matches text "5"). Note this is the OPPOSITE default of <see cref="XLookupB"/>,
+    /// exactly as the native pair disagrees. Errors in <paramref name="lookupValues"/>
+    /// propagate to their result row; misses return <paramref name="ifNotFound"/> when
+    /// supplied, otherwise <c>#N/A</c>.</para>
+    ///
+    /// Marshaling cost: one read per range argument; one bulk write. O(M + R) compute.
+    /// Thread-safety: SAFE for MTR (pure CPU; no object-model access).
+    /// </summary>
+    [ExcelFunction(
+        Name = "EPT.VLOOKUPB",
+        Description = "Batched VLOOKUP: resolve a whole column of keys against a table's first column in one O(M+R) pass; col_index may list several return columns.",
+        Category = "EPT.Lookup",
+        IsThreadSafe = true,
+        IsVolatile = false)]
+    public static object VLookupB(
+        [ExcelArgument(Name = "lookup_values", Description = "One or more keys, read row-major; one result row per key.")] object lookupValues,
+        [ExcelArgument(Name = "table", Description = "Lookup table; keys are matched against its FIRST column.")] object table,
+        [ExcelArgument(Name = "col_index", Description = "1-based table column(s) to return; several indexes spill several columns.")] object colIndex,
+        [ExcelArgument(Name = "if_not_found", Description = "Optional value returned for misses. Defaults to #N/A.")] object ifNotFound,
+        [ExcelArgument(Name = "range_lookup", Description = "Optional. TRUE/omitted = approximate (native VLOOKUP default); FALSE/0 = exact.")] object rangeLookup)
+    {
+        try
+        {
+            var tbl = Marshaling.AsArray2D(table);
+            var tableRows = tbl.GetLength(0);
+            var tableCols = tbl.GetLength(1);
+            var indexes = ResolveColumnIndexes(colIndex, tableCols);
+            var probes = Flatten(Marshaling.AsArray2D(lookupValues));
+            var keys = new object?[tableRows];
+            for (var r = 0; r < tableRows; r++)
+            {
+                keys[r] = tbl[r, 0];
+            }
+
+            var notFound = IsSupplied(ifNotFound) ? ifNotFound : ExcelError.ExcelErrorNA;
+            var rows = ResolveRangeLookup(rangeLookup)
+                ? ResolveRowsApproximate(probes, keys)
+                : ResolveRowsExact(probes, keys);
+
+            var result = new object[probes.Length, indexes.Length];
+            for (var r = 0; r < probes.Length; r++)
+            {
+                if (probes[r] is ExcelError probeErr)
+                {
+                    for (var c = 0; c < indexes.Length; c++)
+                    {
+                        result[r, c] = probeErr;
+                    }
+                    continue;
+                }
+                var at = rows[r];
+                for (var c = 0; c < indexes.Length; c++)
+                {
+                    result[r, c] = at < 0 ? notFound : tbl[at, indexes[c]] ?? ExcelEmpty.Value;
+                }
+            }
+            return result;
+        }
+        catch (Exception ex) when (!IsCritical(ex))
+        {
+            TraceSource.TraceEvent(TraceEventType.Warning, 2, "EPT.VLOOKUPB failed: {0}", ex.Message);
+            return ExcelError.ExcelErrorValue;
+        }
+    }
+
+    /// <summary>
+    /// Recodes every cell of <paramref name="block"/> through an old → new value map in one
+    /// hashed pass - the batch replacement for nested IF/SWITCH chains and helper VLOOKUP
+    /// columns that merely relabel values. The map is built once (the first occurrence of a
+    /// duplicate old value wins; comparison is type-aware and case-insensitive for text,
+    /// exactly like <see cref="XLookupB"/> exact match), then each cell is an O(1) probe.
+    /// Unmapped cells pass through unchanged unless <paramref name="ifMissing"/> is
+    /// supplied; error cells always pass through.
+    /// Marshaling cost: one read per range argument; one bulk write. O(M + N) compute.
+    /// Thread-safety: SAFE for MTR (pure CPU; no object-model access).
+    /// </summary>
+    [ExcelFunction(
+        Name = "EPT.MAPVALUES",
+        Description = "Recode a block through an old->new value map in one hashed pass (replaces nested IF/SWITCH chains).",
+        Category = "EPT.Lookup",
+        IsThreadSafe = true,
+        IsVolatile = false)]
+    public static object MapValues(
+        [ExcelArgument(Name = "block", Description = "Values to recode. Result mirrors this shape.")] object block,
+        [ExcelArgument(Name = "old_values", Description = "Values to find.")] object oldValues,
+        [ExcelArgument(Name = "new_values", Description = "Aligned replacement values.")] object newValues,
+        [ExcelArgument(Name = "if_missing", Description = "Optional value for unmapped cells; omitted passes them through unchanged.")] object ifMissing)
+    {
+        try
+        {
+            var cells = Marshaling.AsArray2D(block);
+            var from = Flatten(Marshaling.AsArray2D(oldValues));
+            var to = Flatten(Marshaling.AsArray2D(newValues));
+            if (from.Length != to.Length)
+            {
+                return ExcelError.ExcelErrorValue;
+            }
+            var map = new Dictionary<CellKey, object?>(from.Length);
+            for (var i = 0; i < from.Length; i++)
+            {
+                map.TryAdd(CellKey.From(from[i]), to[i]);
+            }
+            var hasMissing = IsSupplied(ifMissing);
+            var rows = cells.GetLength(0);
+            var cols = cells.GetLength(1);
+            var result = new object[rows, cols];
+            for (var r = 0; r < rows; r++)
+            {
+                for (var c = 0; c < cols; c++)
+                {
+                    var cell = cells[r, c];
+                    if (cell is ExcelError err)
+                    {
+                        result[r, c] = err;
+                    }
+                    else if (map.TryGetValue(CellKey.From(cell), out var mapped))
+                    {
+                        result[r, c] = mapped ?? ExcelEmpty.Value;
+                    }
+                    else
+                    {
+                        result[r, c] = hasMissing ? ifMissing : (cell ?? ExcelEmpty.Value);
+                    }
+                }
+            }
+            return result;
+        }
+        catch (Exception ex) when (!IsCritical(ex))
+        {
+            TraceSource.TraceEvent(TraceEventType.Warning, 3, "EPT.MAPVALUES failed: {0}", ex.Message);
+            return ExcelError.ExcelErrorValue;
+        }
+    }
+
+    private static int[] ResolveColumnIndexes(object colIndex, int tableCols)
+    {
+        var cells = Flatten(Marshaling.AsArray2D(colIndex));
+        if (cells.Length == 0)
+        {
+            throw new ArgumentException("col_index must supply at least one column index.");
+        }
+        var result = new int[cells.Length];
+        for (var i = 0; i < cells.Length; i++)
+        {
+            if (!Marshaling.TryToDouble(cells[i], out var d) || d < 1d || d != Math.Truncate(d) || d > tableCols)
+            {
+                throw new ArgumentException($"col_index entries must be integers between 1 and {tableCols} (the table's column count).");
+            }
+            result[i] = (int)d - 1;
+        }
+        return result;
+    }
+
+    private static bool ResolveRangeLookup(object rangeLookup)
+    {
+        // Mirrors native VLOOKUP, NOT EPT.XLOOKUPB: omitted/TRUE = approximate, FALSE/0 = exact.
+        if (rangeLookup is bool b)
+        {
+            return b;
+        }
+        if (rangeLookup is null or ExcelMissing or ExcelEmpty)
+        {
+            return true;
+        }
+        if (rangeLookup is string s && bool.TryParse(s, out var parsed))
+        {
+            return parsed;
+        }
+        if (Marshaling.TryToDouble(rangeLookup, out var d))
+        {
+            return d != 0d;
+        }
+        throw new ArgumentException("range_lookup must be TRUE (approximate, the native default) or FALSE/0 (exact).");
+    }
+
+    /// <summary>Resolves each probe to its first-occurrence row among <paramref name="keys"/> (type-aware hash), or -1.</summary>
+    private static int[] ResolveRowsExact(object?[] probes, object?[] keys)
+    {
+        var index = new Dictionary<CellKey, int>(keys.Length);
+        for (var i = 0; i < keys.Length; i++)
+        {
+            index.TryAdd(CellKey.From(keys[i]), i);
+        }
+        var rows = new int[probes.Length];
+        for (var i = 0; i < probes.Length; i++)
+        {
+            rows[i] = probes[i] is not ExcelError && index.TryGetValue(CellKey.From(probes[i]), out var at) ? at : -1;
+        }
+        return rows;
+    }
+
+    /// <summary>Resolves each numeric probe to the row of the largest key &lt;= it (Excel's next-smaller), or -1.</summary>
+    private static int[] ResolveRowsApproximate(object?[] probes, object?[] keys)
+    {
+        var points = new List<(double Key, int Index)>(keys.Length);
+        for (var i = 0; i < keys.Length; i++)
+        {
+            if (IsNumeric(keys[i], out var d))
+            {
+                points.Add((d, i));
+            }
+        }
+        // Same sorted-input fast path and duplicate-key tiebreak as ApproximateLookup.
+        var sorted = true;
+        for (var i = 1; i < points.Count; i++)
+        {
+            if (points[i - 1].Key > points[i].Key)
+            {
+                sorted = false;
+                break;
+            }
+        }
+        if (!sorted)
+        {
+            points.Sort(static (a, b) =>
+            {
+                var byKey = a.Key.CompareTo(b.Key);
+                return byKey != 0 ? byKey : a.Index.CompareTo(b.Index);
+            });
+        }
+        var rows = new int[probes.Length];
+        for (var i = 0; i < probes.Length; i++)
+        {
+            if (probes[i] is ExcelError || !IsNumeric(probes[i], out var target))
+            {
+                rows[i] = -1;
+                continue;
+            }
+            var found = FloorIndex(points, target);
+            rows[i] = found < 0 ? -1 : points[found].Index;
+        }
+        return rows;
+    }
+
     private static bool ResolveMatchMode(object matchMode)
     {
         // Documented legacy form: TRUE/omitted = exact, FALSE = approximate.

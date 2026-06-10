@@ -187,6 +187,150 @@ public static class TextUtilities
             }
         });
 
+    // ---------- Substitution ----------
+
+    /// <summary>
+    /// Native <c>SUBSTITUTE</c> over a whole block in one pass: replaces occurrences of
+    /// <paramref name="oldText"/> with <paramref name="newText"/> in every cell's text,
+    /// case-sensitively and ordinally, exactly like the native function. When
+    /// <paramref name="instanceNum"/> is supplied only that occurrence (1-based) is
+    /// replaced; omitted replaces all; a value below 1 throws (surfaced as <c>#VALUE!</c>).
+    /// Cells whose text contains no occurrence - and all blank and error cells - pass
+    /// through unchanged, so numeric cells stay numeric unless actually edited. A
+    /// replacement that would exceed the 32,767-character cell limit embeds <c>#VALUE!</c>
+    /// in that cell.
+    /// Marshaling cost: O(1). Thread-safety: SAFE for MTR.
+    /// </summary>
+    [ExcelFunction(Name = "EPT.SUBSTITUTE", Description = "SUBSTITUTE over a whole block: replace all (or the Nth) occurrence in every cell.", Category = "EPT.Text", IsThreadSafe = true, IsVolatile = false)]
+    public static object[,] Substitute(
+        object[,] block,
+        [ExcelArgument(Name = "old_text")] string oldText,
+        [ExcelArgument(Name = "new_text")] string newText,
+        [ExcelArgument(Name = "instance_num", Description = "Optional 1-based occurrence to replace; omitted replaces all.")] object instanceNum)
+    {
+        ArgumentNullException.ThrowIfNull(block);
+        oldText ??= string.Empty;
+        newText ??= string.Empty;
+        var instance = ResolveInstance(instanceNum);
+        return MapCells(block, c =>
+        {
+            if (IsBlankCell(c) || oldText.Length == 0)
+            {
+                return c ?? ExcelEmpty.Value;
+            }
+            var s = Marshaling.ToStringSafe(c);
+            var replaced = instance > 0
+                ? ReplaceInstance(s, oldText, newText, instance)
+                : s.Replace(oldText, newText, StringComparison.Ordinal);
+            if (string.Equals(replaced, s, StringComparison.Ordinal))
+            {
+                // Untouched: return the original cell so numerics stay numeric.
+                return c ?? ExcelEmpty.Value;
+            }
+            return replaced.Length > MaxCellChars ? (object)ExcelError.ExcelErrorValue : replaced;
+        });
+    }
+
+    /// <summary>
+    /// Applies an entire find → replace pair table to every cell in one call - the
+    /// single-pass replacement for the classic <c>SUBSTITUTE(SUBSTITUTE(SUBSTITUTE(...)))</c>
+    /// chain, which both re-scans the block per nesting level and is painful past a few
+    /// pairs. Pairs are applied in order per cell (later pairs see earlier pairs' output,
+    /// exactly like the nested-native chain), matching case-sensitively and ordinally.
+    /// Pairs whose find text is blank are skipped. Untouched cells - and all blank and
+    /// error cells - pass through unchanged; an edited cell whose text would exceed the
+    /// 32,767-character limit embeds <c>#VALUE!</c>.
+    /// Marshaling cost: O(1). Thread-safety: SAFE for MTR.
+    /// </summary>
+    [ExcelFunction(Name = "EPT.SUBSTITUTEALL", Description = "Apply a whole find/replace pair table to every cell in one pass (replaces nested SUBSTITUTE chains).", Category = "EPT.Text", IsThreadSafe = true, IsVolatile = false)]
+    public static object[,] SubstituteAll(
+        object[,] block,
+        [ExcelArgument(Name = "find_values", Description = "Texts to find, applied in order.")] object findValues,
+        [ExcelArgument(Name = "replace_values", Description = "Aligned replacement texts.")] object replaceValues)
+    {
+        ArgumentNullException.ThrowIfNull(block);
+        var finds = FlattenToStrings(Marshaling.AsArray2D(findValues));
+        var repls = FlattenToStrings(Marshaling.AsArray2D(replaceValues));
+        if (finds.Length != repls.Length)
+        {
+            throw new ArgumentException("find_values and replace_values must hold the same number of cells.");
+        }
+        var pairs = new List<(string Find, string Replace)>(finds.Length);
+        for (var i = 0; i < finds.Length; i++)
+        {
+            if (finds[i].Length > 0)
+            {
+                pairs.Add((finds[i], repls[i]));
+            }
+        }
+        return MapCells(block, c =>
+        {
+            if (IsBlankCell(c))
+            {
+                return c ?? ExcelEmpty.Value;
+            }
+            var s = Marshaling.ToStringSafe(c);
+            var current = s;
+            foreach (var (find, replace) in pairs)
+            {
+                current = current.Replace(find, replace, StringComparison.Ordinal);
+            }
+            if (string.Equals(current, s, StringComparison.Ordinal))
+            {
+                // Untouched: return the original cell so numerics stay numeric.
+                return c ?? ExcelEmpty.Value;
+            }
+            return current.Length > MaxCellChars ? (object)ExcelError.ExcelErrorValue : current;
+        });
+    }
+
+    private static int ResolveInstance(object instanceNum)
+    {
+        if (Marshaling.IsBlankOrError(instanceNum))
+        {
+            return 0; // replace all
+        }
+        if (!Marshaling.TryToDouble(instanceNum, out var d) || d < 1d || d != Math.Truncate(d) || d > int.MaxValue)
+        {
+            throw new ArgumentException("instance_num must be an integer >= 1.", nameof(instanceNum));
+        }
+        return (int)d;
+    }
+
+    /// <summary>Replaces only the <paramref name="instance"/>-th occurrence (1-based); no occurrence returns the input.</summary>
+    private static string ReplaceInstance(string s, string oldText, string newText, int instance)
+    {
+        var at = -1;
+        var from = 0;
+        for (var seen = 0; seen < instance; seen++)
+        {
+            at = s.IndexOf(oldText, from, StringComparison.Ordinal);
+            if (at < 0)
+            {
+                return s;
+            }
+            from = at + oldText.Length;
+        }
+        return string.Concat(s.AsSpan(0, at), newText, s.AsSpan(at + oldText.Length));
+    }
+
+    private static string[] FlattenToStrings(object[,] block)
+    {
+        var rows = block.GetLength(0);
+        var cols = block.GetLength(1);
+        var result = new string[rows * cols];
+        var idx = 0;
+        for (var r = 0; r < rows; r++)
+        {
+            for (var c = 0; c < cols; c++)
+            {
+                var cell = block[r, c];
+                result[idx++] = Marshaling.IsBlankOrError(cell) ? string.Empty : Marshaling.ToStringSafe(cell);
+            }
+        }
+        return result;
+    }
+
     // ---------- Template fill ----------
 
     /// <summary>

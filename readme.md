@@ -261,6 +261,8 @@ genuinely numeric cells - never numeric-looking text - exactly as Excel does.
 | `EPT.WSTDEV` | `(values, weights) -> double` | **new** | Weighted population stdev. |
 | `EPT.SUMPRODUCTIFS` | `(rangeA, rangeB, critRange1, crit1, ...) -> double` | **new** | Conditional `sum(a*b)`. |
 | `EPT.GROUPBY` | `(keyRange, valueRange, operation) -> object[,]` | **new** | One-pass GROUP BY; spills distinct keys + one aggregate. |
+| `EPT.CASEWHEN` | `(testRange, crit1, result1, ..., [default]) -> object[,]` | **new** | Vectorized CASE WHEN: first matching (criteria, result) pair per cell; replaces nested IF/IFS/SWITCH chains. Results may be scalars (broadcast) or same-shaped blocks; a trailing unpaired value is the default, else `#N/A` like native SWITCH. |
+| `EPT.TEXTJOINIFS` | `(textRange, delimiter, critRange1, crit1, ...) -> string` | **new** | Conditional TEXTJOIN: join the text of matched cells (the clean form of the `TEXTJOIN(IF(...))` array idiom). |
 
 `EPT.GROUPBY` operations: `sum`, `count`, `average`, `min`, `max`, `median`,
 `stdev`, `stdevp`, `var`, `varp`, `product`, `mode`, `geomean`, `harmean`,
@@ -272,6 +274,8 @@ composite key.
 | Function | Signature | Description |
 | --- | --- | --- |
 | `EPT.XLOOKUPB` | `(lookupValues, lookupArray, returnArray, [ifNotFound], [matchMode]) -> object[,]` | Resolve a whole column of keys in one O(M+R) pass. Exact (hash) by default (`matchMode` omitted, `TRUE`, or `0`); `matchMode = FALSE` or `-1` (XLOOKUP's next-smaller mode) does approximate match over the numeric keys, sorting them internally if needed. Exact match is type-aware like native XLOOKUP: numeric 5 never matches text `"5"`; errors in `lookupValues` propagate. Result mirrors `lookupValues`' shape; misses return `ifNotFound` or `#N/A`. **`IsThreadSafe = true`.** |
+| `EPT.VLOOKUPB` | `(lookupValues, table, colIndex, [ifNotFound], [rangeLookup]) -> object[,]` | Batched VLOOKUP: keys match against the table's **first** column; `colIndex` is 1-based and may list **several** columns (one output column per index), so one call replaces a whole bank of VLOOKUP columns. `rangeLookup` mirrors native VLOOKUP: omitted/`TRUE` = approximate, `FALSE`/`0` = exact - the opposite default of `EPT.XLOOKUPB`, exactly as the native pair disagrees. **`IsThreadSafe = true`.** |
+| `EPT.MAPVALUES` | `(block, oldValues, newValues, [ifMissing]) -> object[,]` | Recode a block through an old → new value map in one hashed pass - the batch replacement for nested IF/SWITCH chains that merely relabel values. Unmapped cells pass through unchanged unless `ifMissing` is supplied. **`IsThreadSafe = true`.** |
 
 ### Text utilities (`TextUtilities.cs`)
 
@@ -287,6 +291,8 @@ pad/repeat/reverse pass blanks and errors through.
 | `EPT.ZEROPAD` | `(block, totalWidth) -> object[,]` | Left-pad with `0` to a width. |
 | `EPT.REPEAT` | `(block, count) -> object[,]` | Repeat each cell's text N times. |
 | `EPT.REVERSE` | `(block) -> object[,]` | Reverse each cell's characters. |
+| `EPT.SUBSTITUTE` | `(block, oldText, newText, [instanceNum]) -> object[,]` | Native SUBSTITUTE over a whole block: replace all (or only the Nth) occurrence per cell, case-sensitive like native. Untouched cells pass through, so numerics stay numeric. |
+| `EPT.SUBSTITUTEALL` | `(block, findValues, replaceValues) -> object[,]` | Apply an entire find/replace pair table per cell in one pass - replaces `SUBSTITUTE(SUBSTITUTE(...))` chains. Pairs apply in order, like the nested chain. |
 | `EPT.TEMPLATEFILL` | `(template, data, [hasHeaderRow]) -> object[,]` | Mail-merge: render `{name}`/`{index}` placeholders once per data row. |
 
 ### Regex utilities (`RegexUtilities.cs`)
@@ -309,6 +315,10 @@ surface as `#VALUE!` in that cell; invalid patterns return `#VALUE!`.
 | `EPT.FILLFORWARD` | `(block, [direction]) -> object[,]` | Fill blanks from the previous value `down`/`up`/`right`/`left`. |
 | `EPT.OUTLIERS` | `(block, [method], [threshold]) -> object[,]` | TRUE/FALSE outlier flags via `iqr`/`zscore`/`mad`. |
 | `EPT.QUANTILES` | `(block, probabilities) -> object[,]` | Inclusive quantiles for each requested probability. |
+| `EPT.RUNNINGAGG` | `(block, operation) -> object[,]` | Cumulative `sum`/`count`/`average`/`min`/`max`/`product` down each column in one O(N) pass - replaces the O(N²) `=SUM($A$1:A1)` expanding-range pattern. |
+| `EPT.MOVINGAGG` | `(block, window, operation, [minPeriods]) -> object[,]` | Trailing-window `sum`/`average`/`count`/`min`/`max`/`median`/`stdev` per column in one pass (monotonic deque for min/max) - replaces volatile O(N·W) `OFFSET` windows. |
+| `EPT.RANKB` | `(block, [order], [ties]) -> object[,]` | Rank every numeric cell in one O(N log N) pass - a column of native RANK formulas is O(N²). Tie modes: `eq` (RANK.EQ), `avg` (RANK.AVG), `dense` (**no native equivalent**), `ordinal`. |
+| `EPT.PERCENTRANKB` | `(block, [significance]) -> object[,]` | PERCENTRANK.INC of every numeric cell in one O(N log N) pass. |
 
 ### Dates (`DateUtilities.cs`)
 
@@ -369,6 +379,30 @@ store/return results for reuse - they do not prevent the inner formula from comp
 | `EPT.DISKCACHE.WRITE` | `(key, block) -> double` | Persist a block (survives reopen); returns row count. |
 | `EPT.DISKCACHE.READ` | `(key, [ifMissing]) -> object` | Load a persisted block. |
 | `EPT.DISKCACHE.CLEAR` | `([key]) -> double` | Delete one key or all; returns count removed. |
+
+## VBA convenience module (`vba/EptToolkit.bas`)
+
+A drop-in `.bas` module for workbooks that drive the toolkit from VBA. Import
+it via **VBE → File → Import File...**. It contains:
+
+- **Fast-mode guards** - `EptFastModeBegin`/`EptFastModeEnd` wrap any macro in
+  the standard suspension of screen updates, automatic calculation, events,
+  and the status bar. Nesting-safe: state is only restored when the outermost
+  pair closes.
+- **Auto-optimization hooks** - `EptAutoOptimizeOpen` (enable multithreaded
+  recalc with one thread per core, disable UI animation, warm the XLL) and
+  `EptAutoOptimizeClose` (clear the EPT session cache, restore UI defaults),
+  designed to be called from `Workbook_Open` / `Workbook_BeforeClose` - the
+  two-line `ThisWorkbook` snippet is in the module header.
+- **One-crossing primitives** - `EptReadRange` (bulk read, 1×1-safe),
+  `EptWriteArray` (bulk write sized from an anchor), and
+  `EptTransformRange(range, "EPT.FUNC", args...)` (read → transform in the
+  XLL → write back: two crossings total).
+- **Use-case wrappers** - `EptCleanRange` (trim + coerce numerics),
+  `EptVLookupFast` (batched lookup written at a destination; exact match by
+  default), `EptSubstituteAll`, `EptGroupBy`, `EptRunningTotals`,
+  `EptImportCsv`/`EptExportCsv`, and `EptRangeHash`. Plus `EptIsAvailable`
+  to probe whether the XLL is loaded.
 
 ## Before and after: the one-crossing rule, demonstrated
 
@@ -637,3 +671,6 @@ sorted-ascending approximate match with a trailing `FALSE`.
 
 - `docs/usage.md` - copy-paste examples for every public function from both
   the formula bar and VBA, with the mandatory MTR safety warning.
+- `vba/EptToolkit.bas` - the drop-in VBA convenience module: fast-mode
+  guards, workbook open/close auto-optimization hooks, and one-line wrappers
+  for the common EPT use cases.
