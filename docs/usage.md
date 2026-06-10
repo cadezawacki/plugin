@@ -521,6 +521,291 @@ n = Application.Run("EPT.WRITECSV", "C:\out\result.csv", _
                     Worksheets("Data").Range("A1:Z1000").Value)
 ```
 
+## Conditional aggregation (MTR-eligible)
+
+All `EPT.*IFS`, weighted, `SUMPRODUCTIFS`, and `GROUPBY` functions are
+registered with `IsThreadSafe = true`. They are pure CPU over their
+`object[,]` arguments and never touch the Excel object model. Criteria use
+Excel's grammar: `">5"`, `"<=10"`, `"<>x"`, `"=v"`, the wildcards `*`/`?`
+(with `~` escaping a literal wildcard), and the empty-operand blank/non-blank
+forms `""` and `"<>"`. Numeric comparisons match only genuinely numeric
+cells, not numeric-looking text - exactly like Excel.
+
+### Faster `*IFS` (drop-in for the native versions)
+
+```
+=EPT.COUNTIFS(Data!A1:A100000, ">0", Data!B1:B100000, "West")
+=EPT.SUMIFS(Data!C1:C100000, Data!A1:A100000, ">0", Data!B1:B100000, "West")
+=EPT.AVERAGEIFS(Data!C1:C100000, Data!B1:B100000, "W*")
+=EPT.MINIFS(Data!C1:C100000, Data!B1:B100000, "West")
+=EPT.MAXIFS(Data!C1:C100000, Data!B1:B100000, "West")
+```
+
+```vba
+Dim total As Double
+total = Application.Run("EPT.SUMIFS", _
+        Worksheets("Data").Range("C1:C100000").Value, _
+        Worksheets("Data").Range("A1:A100000").Value, ">0", _
+        Worksheets("Data").Range("B1:B100000").Value, "West")
+```
+
+### Conditional aggregates Excel lacks natively
+
+```
+=EPT.MEDIANIFS(Data!C1:C100000, Data!B1:B100000, "West")
+=EPT.PERCENTILEIFS(Data!C1:C100000, 0.95, Data!B1:B100000, "West")
+=EPT.STDEVIFS(Data!C1:C100000, Data!B1:B100000, "West")
+=EPT.VARPIFS(Data!C1:C100000, Data!B1:B100000, "West")
+=EPT.MODEIFS(Data!C1:C100000, Data!B1:B100000, "West")
+=EPT.GEOMEANIFS(Data!C1:C100000, Data!B1:B100000, "West")
+=EPT.HARMEANIFS(Data!C1:C100000, Data!B1:B100000, "West")
+=EPT.PRODUCTIFS(Data!C1:C100000, Data!B1:B100000, "West")
+=EPT.DISTINCTCOUNTIFS(Data!C1:C100000, Data!B1:B100000, "West")
+=EPT.FIRSTIFS(Data!C1:C100000, Data!B1:B100000, "West")
+=EPT.LASTIFS(Data!C1:C100000, Data!B1:B100000, "West")
+```
+
+### Weighted statistics
+
+```
+=EPT.WAVG(Data!Price, Data!Qty)
+=EPT.WAVGIFS(Data!Price, Data!Qty, Data!Region, "West", Data!Year, 2025)
+=EPT.WMEDIAN(Data!Price, Data!Qty)
+=EPT.WSTDEV(Data!Price, Data!Qty)
+```
+
+```vba
+Dim w As Double
+w = Application.Run("EPT.WAVG", _
+        Worksheets("Data").Range("A1:A100000").Value, _
+        Worksheets("Data").Range("B1:B100000").Value)
+```
+
+### Conditional SUMPRODUCT
+
+```
+=EPT.SUMPRODUCTIFS(Data!Price, Data!Qty, Data!Region, "West")
+```
+
+### `EPT.GROUPBY(key_range, value_range, operation)`
+
+Returns a spilled table of distinct keys with one aggregate per group, in
+first-seen order. `key_range` may span several columns to form a composite
+key; the first column of `value_range` supplies the values. `operation` is
+one of `sum`, `count`, `average`, `min`, `max`, `median`, `stdev`, `stdevp`,
+`var`, `varp`, `product`, `mode`, `geomean`, `harmean`, `distinct`, `first`,
+`last`.
+
+```
+=EPT.GROUPBY(Sales!A2:A100000, Sales!D2:D100000, "sum")
+=EPT.GROUPBY(Sales!A2:B100000, Sales!D2:D100000, "average")
+```
+
+```vba
+Dim g As Variant
+g = Application.Run("EPT.GROUPBY", _
+        Worksheets("Sales").Range("A2:A100000").Value, _
+        Worksheets("Sales").Range("D2:D100000").Value, "sum")
+```
+
+## Boosted lookups
+
+### `EPT.XLOOKUPB(lookup_values, lookup_array, return_array, [if_not_found], [match_mode])`
+
+Resolves an entire column of lookup keys in one O(M+R) pass: the lookup
+column is indexed once, then probed for every key. The result mirrors the
+shape of `lookup_values`. Exact match (default) is case-insensitive; pass
+`FALSE` as `match_mode` for sorted-ascending approximate (next-smaller)
+match. Misses return `if_not_found` when supplied, otherwise `#N/A`.
+
+```
+=EPT.XLOOKUPB(A2:A100000, Table!A2:A100000, Table!E2:E100000)
+=EPT.XLOOKUPB(A2:A100000, Table!A2:A100000, Table!E2:E100000, "n/a")
+=EPT.XLOOKUPB(A2:A100000, Brackets!A2:A20, Brackets!B2:B20, "", FALSE)
+```
+
+```vba
+Dim res As Variant
+res = Application.Run("EPT.XLOOKUPB", _
+        Worksheets("Keys").Range("A2:A100000").Value, _
+        Worksheets("Table").Range("A2:A100000").Value, _
+        Worksheets("Table").Range("E2:E100000").Value)
+```
+
+## Text utilities (MTR-eligible)
+
+All `EPT.*` text functions are `IsThreadSafe = true`, whole-block, one-crossing. Case
+functions leave non-string cells untouched; pad/repeat/reverse pass blanks and errors
+through.
+
+```
+=EPT.PROPER(Data!A1:A1000)
+=EPT.TITLECASE(Data!A1:A1000)
+=EPT.CAMELCASE(Data!A1:A1000)
+=EPT.PADLEFT(Data!A1:A1000, 10)
+=EPT.PADRIGHT(Data!A1:A1000, 10, ".")
+=EPT.ZEROPAD(Data!A1:A1000, 6)
+=EPT.REPEAT(Data!A1:A1000, 3)
+=EPT.REVERSE(Data!A1:A1000)
+```
+
+`EPT.TEMPLATEFILL(template, data, [has_header_row])` renders a template once per data
+row. Placeholders are `{HeaderName}` (when a header row is present) or `{0}`-style column
+indexes; use `{{`/`}}` for literal braces.
+
+```
+=EPT.TEMPLATEFILL("Dear {Name}, your balance is {Amount}.", Data!A1:B100)
+=EPT.TEMPLATEFILL("{0}-{1}", Data!A2:B100, FALSE)
+```
+
+```vba
+arr = Application.Run("EPT.TEMPLATEFILL", "Hi {Name}", Worksheets("Data").Range("A1:A100").Value)
+```
+
+## Regex utilities (MTR-eligible)
+
+Pattern is compiled once per call with a 1-second match timeout. `ignore_case` defaults to
+FALSE. `EPT.REGEXEXTRACTALL` and `EPT.REGEXSPLIT` require a single-column input and spill
+across columns.
+
+```
+=EPT.REGEXMATCH(Data!A1:A1000, "^[A-Z]{2}\d+$")
+=EPT.REGEXCOUNT(Data!A1:A1000, "\d")
+=EPT.REGEXEXTRACT(Data!A1:A1000, "(\d{4})-(\d{2})", 1)
+=EPT.REGEXEXTRACTALL(Data!A1:A1000, "\d+")
+=EPT.REGEXSPLIT(Data!A1:A1000, "\s*,\s*")
+```
+
+```vba
+arr = Application.Run("EPT.REGEXEXTRACT", arr, "[0-9]+", 0, False)
+```
+
+## Series cleaning & robust stats (MTR-eligible)
+
+```
+=EPT.FILLFORWARD(Data!A1:D1000)            ' down (default)
+=EPT.FILLFORWARD(Data!A1:D1000, "right")
+=EPT.OUTLIERS(Data!A1:A1000)               ' iqr, 1.5x fences
+=EPT.OUTLIERS(Data!A1:A1000, "zscore", 2.5)
+=EPT.QUANTILES(Data!A1:A1000, {0;0.25;0.5;0.75;1})
+```
+
+```vba
+flags = Application.Run("EPT.OUTLIERS", arr, "mad", 3)
+```
+
+## Working-day arithmetic
+
+`EPT.WORKDAYADD(start_dates, days, [weekend_mask], [holidays])` adds working days using a
+7-character `Mon..Sun` weekend mask (`'1'` = non-working, default `"0000011"`). `start_dates`
+and `days` may each be a scalar or a block (a scalar is broadcast).
+
+```
+=EPT.WORKDAYADD(A2, 10)
+=EPT.WORKDAYADD(A2:A100, 5, "0000011", Holidays!A1:A20)
+=EPT.WORKDAYADD(A2, -3, "1000001")        ' Monday & Sunday as weekend
+```
+
+```vba
+serial = Application.Run("EPT.WORKDAYADD", DateSerial(2026, 1, 2), 10)
+```
+
+## Pairwise distance
+
+`EPT.DISTANCE(matrix_a, [matrix_b], [metric])` treats each row as an observation vector and
+returns the full distance matrix. Omit `matrix_b` to compare `matrix_a` to itself.
+
+```
+=EPT.DISTANCE(Data!A2:E50)                 ' 49x49 euclidean self-distances
+=EPT.DISTANCE(Data!A2:E50, Centroids!A2:E5, "cosine")
+=EPT.DISTANCE(Data!A2:E50, Data!A2:E50, "manhattan")
+```
+
+```vba
+m = Application.Run("EPT.DISTANCE", a, b, "euclidean")
+```
+
+## JSON
+
+Built on the in-box `System.Text.Json`. `EPT.JSONPATH` and `EPT.PARSEJSON` are MTR-safe
+and operate on JSON text already in the grid; `EPT.READJSON`/`EPT.READNDJSON`/`EPT.WRITEJSON`
+are async file functions that never open a workbook. Path syntax is dotted keys plus
+`[index]` with an optional leading `$`/`$.`.
+
+### `EPT.JSONPATH(json, path)` and `EPT.PARSEJSON(json, [path], [hasHeaderRow])`
+
+```
+=EPT.JSONPATH(A1:A1000, "address.city")
+=EPT.JSONPATH(A1:A1000, "items[0].sku")
+=EPT.PARSEJSON(A1)                          ' expand a document to a table
+=EPT.PARSEJSON(A1, "data.rows")             ' expand a sub-node
+=EPT.PARSEJSON(A1, "", FALSE)               ' no header row
+```
+
+```vba
+city = Application.Run("EPT.JSONPATH", arr, "address.city")
+tbl = Application.Run("EPT.PARSEJSON", jsonText, "data.rows")
+```
+
+### `EPT.READJSON` / `EPT.READNDJSON` / `EPT.WRITEJSON`
+
+```
+=EPT.READJSON("C:\data\orders.json")
+=EPT.READJSON("C:\data\payload.json", "data.orders")
+=EPT.READNDJSON("C:\data\events.ndjson")
+=EPT.WRITEJSON("C:\out\rows.json", Data!A1:D1000)        ' array of objects (row 1 = keys)
+=EPT.WRITEJSON("C:\out\rows.json", Data!A1:D1000, FALSE, TRUE)  ' arrays, pretty-printed
+```
+
+```vba
+arr = Application.Run("EPT.READJSON", "C:\data\orders.json")
+Worksheets("Data").Range("A1").Resize(UBound(arr, 1), UBound(arr, 2)).Value = arr
+n = Application.Run("EPT.WRITEJSON", "C:\out\rows.json", _
+                    Worksheets("Data").Range("A1:D1000").Value)
+```
+
+## Filesystem
+
+`EPT.FILEINFO` and `EPT.READFOLDER` work directly against the filesystem (no workbook
+open). `EPT.WATCHFILE`/`EPT.WATCHFOLDER` are live RTD triggers.
+
+```
+=EPT.FILEINFO("C:\data\prices.csv")
+=EPT.FILEINFO(A1:A20)                          ' metadata for a column of paths
+=EPT.READFOLDER("C:\data", "*.csv")            ' concatenate, align by header
+=EPT.READFOLDER("C:\data", "*.json", TRUE)     ' recurse subfolders
+=EPT.WATCHFILE("C:\data\prices.csv")           ' increments when the file changes
+=EPT.WATCHFOLDER("C:\data")                     ' increments on any change in the folder
+```
+
+A common pattern: make an import depend on the watch trigger so it re-runs on change.
+
+```
+=IF(EPT.WATCHFILE("C:\data\prices.csv")>=0, EPT.READCSV("C:\data\prices.csv"), "")
+```
+
+## Result caching
+
+`EPT.MEMOIZE`/`EPT.CACHE.*` are an in-memory session cache; `EPT.DISKCACHE.*` persists
+across reopen. Build keys from input content with `EPT.HASHBLOCK`. (Excel computes a UDF's
+arguments first, so these store and reuse results - they do not stop the inner formula from
+computing once.)
+
+```
+=EPT.MEMOIZE("prices_v1", EPT.READCSV("C:\data\prices.csv"))
+=EPT.CACHE.GET("prices_v1")
+=EPT.CACHE.GET("missing", "n/a")
+=EPT.CACHE.CLEAR()                              ' clear everything; returns count
+=EPT.DISKCACHE.WRITE("daily_"&TODAY(), Data!A1:Z1000)
+=EPT.DISKCACHE.READ("daily_"&TODAY())
+=EPT.DISKCACHE.CLEAR("daily_"&TODAY())
+```
+
+```vba
+Application.Run "EPT.DISKCACHE.WRITE", "snapshot", Worksheets("Data").Range("A1:Z1000").Value
+arr = Application.Run("EPT.DISKCACHE.READ", "snapshot")
+```
+
 ## Public .NET-only entry points
 
 These are not registered as UDFs because they take delegates,

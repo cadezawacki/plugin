@@ -330,7 +330,9 @@ internal sealed class FeedManager
             "counter" => new CounterFeed(trimmed, ParseInt(args, defaultValue: 1000)),
             "sine" => new SineFeed(trimmed, ParseSineArgs(args)),
             "random" => new RandomFeed(trimmed),
-            _ => throw new ArgumentException($"Unknown feed type '{head}'. Expected one of: clock, counter, sine, random."),
+            "watchfile" => new WatchFileFeed(trimmed, args),
+            "watchfolder" => new WatchFolderFeed(trimmed, args),
+            _ => throw new ArgumentException($"Unknown feed type '{head}'. Expected one of: clock, counter, sine, random, watchfile, watchfolder."),
         };
     }
 

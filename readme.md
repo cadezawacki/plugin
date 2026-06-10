@@ -46,6 +46,29 @@ After the first three fixes landed, three more surfaced on production workloads:
    streaming I/O through managed `FileStream`s with async + cancellation,
    never touching the object model.
 
+## Third-wave bottlenecks (conditional aggregation and lookups)
+
+Two more bottlenecks surface specifically around conditional aggregation and
+lookups - the work most real spreadsheets spend their recalc budget on:
+
+7. **Conditional functions re-scan their ranges per formula.** A column of
+   *R* native `SUMIFS`/`COUNTIFS`/`AVERAGEIFS` formulas, each scanning a
+   criteria range of *M* cells, is O(*R*·*M*) and is recomputed on every
+   edit. The fix is to take the value and criteria ranges as one bulk
+   `object[,]` each (one crossing apiece), build the match mask in a single
+   managed-memory pass, and register every function `IsThreadSafe = true` so
+   Excel's MTR engine fans the column out across cores. The same engine also
+   adds the conditional aggregates Excel **lacks natively** - `MEDIANIFS`,
+   `PERCENTILEIFS`, `MODEIFS`, `STDEVIFS`/`VARIFS`, `GEOMEANIFS`/`HARMEANIFS`,
+   `PRODUCTIFS`, `DISTINCTCOUNTIFS`, `FIRSTIFS`/`LASTIFS` - plus weighted
+   statistics (`WAVG`, `WAVGIFS`, `WMEDIAN`, `WSTDEV`), a conditional
+   `SUMPRODUCT`, and a one-pass `GROUP BY`.
+8. **`VLOOKUP`/`XLOOKUP` re-scan the table per lookup.** A column of *R*
+   lookups against a table of *M* rows is O(*R*·*M*). The fix is to build the
+   table's index **once** - a hash map for exact match, a sorted array for
+   approximate match - and probe it for every lookup value: O(*M* + *R*)
+   total, table read in a single crossing. That is `EPT.XLOOKUPB`.
+
 ## Architecture
 
 ```
@@ -58,6 +81,17 @@ ExcelPerfToolkit (single net8.0-windows class library, packed as XLL)
 ├── VectorizedKernels.cs     - SIMD kernels with scalar fallback (#4)
 ├── RtdServer.cs             - Multithreaded RTD server + feed manager (#5)
 ├── DirectFileIO.cs          - Async CSV/TSV streaming, no object model (#6)
+├── ConditionalAggregates.cs - *IFS family, weighted stats, SUMPRODUCTIFS, GROUPBY (#7)
+├── LookupBoost.cs           - Batched exact/approximate lookup, O(M+R) (#8)
+├── TextUtilities.cs         - Case/pad/repeat/reverse/templatefill over blocks (#1, #2)
+├── RegexUtilities.cs        - Match/count/extract/extractall/split over blocks (#1, #2)
+├── SeriesUtilities.cs       - Fill-forward, outliers, quantiles (#1, #2)
+├── DateUtilities.cs         - WORKDAYADD (vectorized WORKDAY.INTL) (#1, #2)
+├── DistanceUtilities.cs     - Pairwise distance matrices via SIMD dot products (#4)
+├── JsonUtilities.cs         - JSONPATH/PARSEJSON + async READ/WRITE JSON & NDJSON (#1, #2, #6)
+├── FileSystemUtilities.cs   - FILEINFO, READFOLDER, WATCHFILE/WATCHFOLDER (#6)
+├── WatchFeeds.cs            - FileSystemWatcher-backed RTD feeds for the watch UDFs (#5, #6)
+├── CacheUtilities.cs        - Session cache (MEMOIZE/CACHE.*) + disk cache (DISKCACHE.*)
 └── ToolkitLifetime.cs       - Shared shutdown CancellationTokenSource + TraceSource factory
 ```
 
@@ -196,6 +230,142 @@ model. Honors `ToolkitLifetime.ShutdownToken` for clean cancellation.
 | `EPT.WRITECSV` | `(path, block, delim?, encoding?) -> double` | Stream a block to a delimited file; returns row count. |
 | `DirectFileIO.ReadDelimitedAsync` | async API | Same as `EPT.READCSV` with a `CancellationToken`. |
 | `DirectFileIO.WriteDelimitedAsync` | async API | Same as `EPT.WRITECSV` with a `CancellationToken`. |
+
+### Conditional aggregation (`ConditionalAggregates.cs`)
+
+Every function is `IsThreadSafe = true` (MTR-eligible) and pure CPU over its
+`object[,]` arguments. Criteria follow Excel's grammar: comparison prefixes
+(`">5"`, `"<=10"`, `"<>x"`), case-insensitive text with `*`/`?` wildcards
+(`~` escapes a literal wildcard), the empty-operand blank/non-blank forms
+(`""`, `"<>"`), and bare numeric criteria. Numeric comparisons match only
+genuinely numeric cells - never numeric-looking text - exactly as Excel does.
+
+| Function | Signature | Native? | Description |
+| --- | --- | --- | --- |
+| `EPT.COUNTIFS` | `(critRange1, crit1, ...) -> double` | faster | Count cells matching every pair. |
+| `EPT.SUMIFS` | `(sumRange, critRange1, crit1, ...) -> double` | faster | Sum of matched numeric cells. |
+| `EPT.AVERAGEIFS` | `(avgRange, ...) -> double` | faster | Mean of matched cells. |
+| `EPT.MINIFS` / `EPT.MAXIFS` | `(range, ...) -> double` | faster | Min / max of matched cells. |
+| `EPT.MEDIANIFS` | `(range, ...) -> double` | **new** | Conditional median. |
+| `EPT.PERCENTILEIFS` | `(range, k, ...) -> double` | **new** | Conditional inclusive percentile, `k` in [0,1]. |
+| `EPT.STDEVIFS` / `EPT.STDEVPIFS` | `(range, ...) -> double` | **new** | Conditional sample / population stdev. |
+| `EPT.VARIFS` / `EPT.VARPIFS` | `(range, ...) -> double` | **new** | Conditional sample / population variance. |
+| `EPT.MODEIFS` | `(range, ...) -> double` | **new** | Conditional mode (`#N/A` if none repeats). |
+| `EPT.GEOMEANIFS` / `EPT.HARMEANIFS` | `(range, ...) -> double` | **new** | Conditional geometric / harmonic mean. |
+| `EPT.PRODUCTIFS` | `(range, ...) -> double` | **new** | Conditional product. |
+| `EPT.DISTINCTCOUNTIFS` | `(range, ...) -> double` | **new** | Count of distinct matched values. |
+| `EPT.FIRSTIFS` / `EPT.LASTIFS` | `(range, ...) -> value` | **new** | First / last matched value. |
+| `EPT.WAVG` | `(values, weights) -> double` | **new** | Weighted average. |
+| `EPT.WAVGIFS` | `(values, weights, critRange1, crit1, ...) -> double` | **new** | Conditional weighted average. |
+| `EPT.WMEDIAN` | `(values, weights) -> double` | **new** | Weighted median (lower). |
+| `EPT.WSTDEV` | `(values, weights) -> double` | **new** | Weighted population stdev. |
+| `EPT.SUMPRODUCTIFS` | `(rangeA, rangeB, critRange1, crit1, ...) -> double` | **new** | Conditional `sum(a*b)`. |
+| `EPT.GROUPBY` | `(keyRange, valueRange, operation) -> object[,]` | **new** | One-pass GROUP BY; spills distinct keys + one aggregate. |
+
+`EPT.GROUPBY` operations: `sum`, `count`, `average`, `min`, `max`, `median`,
+`stdev`, `stdevp`, `var`, `varp`, `product`, `mode`, `geomean`, `harmean`,
+`distinct`, `first`, `last`. `keyRange` may span several columns to form a
+composite key.
+
+### Boosted lookups (`LookupBoost.cs`)
+
+| Function | Signature | Description |
+| --- | --- | --- |
+| `EPT.XLOOKUPB` | `(lookupValues, lookupArray, returnArray, [ifNotFound], [matchMode]) -> object[,]` | Resolve a whole column of keys in one O(M+R) pass. Exact (hash) by default; `matchMode = FALSE` does sorted-ascending approximate (next-smaller) match. Result mirrors `lookupValues`' shape; misses return `ifNotFound` or `#N/A`. **`IsThreadSafe = true`.** |
+
+### Text utilities (`TextUtilities.cs`)
+
+All MTR-safe, whole-block, one-crossing. Case functions pass non-string cells through;
+pad/repeat/reverse pass blanks and errors through.
+
+| Function | Signature | Description |
+| --- | --- | --- |
+| `EPT.PROPER` | `(block) -> object[,]` | Proper-case each word (first upper, rest lower). |
+| `EPT.TITLECASE` | `(block) -> object[,]` | Title-case, preserving all-caps acronyms. |
+| `EPT.CAMELCASE` | `(block) -> object[,]` | `camelCase`, dropping separators. |
+| `EPT.PADLEFT` / `EPT.PADRIGHT` | `(block, totalWidth, [padChar]) -> object[,]` | Pad each cell's text to a width. |
+| `EPT.ZEROPAD` | `(block, totalWidth) -> object[,]` | Left-pad with `0` to a width. |
+| `EPT.REPEAT` | `(block, count) -> object[,]` | Repeat each cell's text N times. |
+| `EPT.REVERSE` | `(block) -> object[,]` | Reverse each cell's characters. |
+| `EPT.TEMPLATEFILL` | `(template, data, [hasHeaderRow]) -> object[,]` | Mail-merge: render `{name}`/`{index}` placeholders once per data row. |
+
+### Regex utilities (`RegexUtilities.cs`)
+
+Pattern compiled once per call with a 1s match timeout (ReDoS-safe). Per-cell timeouts
+surface as `#VALUE!` in that cell; invalid patterns return `#VALUE!`.
+
+| Function | Signature | Description |
+| --- | --- | --- |
+| `EPT.REGEXMATCH` | `(block, pattern, [ignoreCase]) -> object[,]` | TRUE/FALSE per cell. |
+| `EPT.REGEXCOUNT` | `(block, pattern, [ignoreCase]) -> object[,]` | Count of matches per cell. |
+| `EPT.REGEXEXTRACT` | `(block, pattern, [groupIndex], [ignoreCase]) -> object[,]` | First match (or capture group) per cell. |
+| `EPT.REGEXEXTRACTALL` | `(column, pattern, [groupIndex], [ignoreCase]) -> object[,]` | All matches per row of a single column, spilled across columns. |
+| `EPT.REGEXSPLIT` | `(column, pattern, [ignoreCase]) -> object[,]` | Split each cell of a single column by a regex, spilled across columns. |
+
+### Series & robust stats (`SeriesUtilities.cs`)
+
+| Function | Signature | Description |
+| --- | --- | --- |
+| `EPT.FILLFORWARD` | `(block, [direction]) -> object[,]` | Fill blanks from the previous value `down`/`up`/`right`/`left`. |
+| `EPT.OUTLIERS` | `(block, [method], [threshold]) -> object[,]` | TRUE/FALSE outlier flags via `iqr`/`zscore`/`mad`. |
+| `EPT.QUANTILES` | `(block, probabilities) -> object[,]` | Inclusive quantiles for each requested probability. |
+
+### Dates (`DateUtilities.cs`)
+
+| Function | Signature | Description |
+| --- | --- | --- |
+| `EPT.WORKDAYADD` | `(startDates, days, [weekendMask], [holidays]) -> object` | Add working days with a 7-char `Mon..Sun` weekend mask and holiday list; scalar or block, broadcast. |
+
+### Distance (`DistanceUtilities.cs`)
+
+| Function | Signature | Description |
+| --- | --- | --- |
+| `EPT.DISTANCE` | `(matrixA, [matrixB], [metric]) -> object[,]` | Pairwise distance matrix between row vectors. `euclidean` (default) and `cosine` route through the SIMD dot-product kernel; also `manhattan`, `chebyshev`. |
+
+### JSON (`JsonUtilities.cs`)
+
+Built on the in-box `System.Text.Json` (no third-party dependency). Path syntax is a
+documented subset: dotted keys and `[index]` steps with an optional leading `$`/`$.`
+(e.g. `data.items[0].name`). The two cell functions are MTR-safe; the three file functions
+are async and never open a workbook.
+
+| Function | Signature | MTR? | Description |
+| --- | --- | --- | --- |
+| `EPT.JSONPATH` | `(json, path) -> object[,]` | yes | Extract a value at `path` from the JSON in each cell. |
+| `EPT.PARSEJSON` | `(json, [path], [hasHeaderRow]) -> object[,]` | yes | Expand one JSON document into a spilled table. |
+| `EPT.READJSON` | `(path, [pointer], [hasHeaderRow]) -> object[,]` | no | Read a JSON file into a bulk array. |
+| `EPT.READNDJSON` | `(path, [hasHeaderRow]) -> object[,]` | no | Read newline-delimited JSON, streamed line by line. |
+| `EPT.WRITEJSON` | `(path, block, [hasHeaderRow], [indent]) -> double` | no | Write a block as a JSON array of objects/arrays; returns the record count. |
+
+Internal .NET-only async entry points: `JsonUtilities.ReadJsonAsync`,
+`ReadNdjsonAsync`, `WriteJsonAsync` (each takes a `CancellationToken`).
+
+### Filesystem (`FileSystemUtilities.cs`, `WatchFeeds.cs`)
+
+| Function | Signature | MTR? | Description |
+| --- | --- | --- | --- |
+| `EPT.FILEINFO` | `(paths) -> object[,]` | no | Metadata table: `Path, Exists, IsDirectory, SizeBytes, Modified, Created, Extension, Name`. |
+| `EPT.READFOLDER` | `(folder, [pattern], [recursive], [hasHeaderRow]) -> object[,]` | no | Read & concatenate matching files (CSV/TSV/JSON/NDJSON), aligning columns by header. |
+| `EPT.WATCHFILE` | `(path) -> double` | yes | Live RTD change counter for a file - a recalculation trigger. |
+| `EPT.WATCHFOLDER` | `(path) -> double` | yes | Live RTD change counter for a folder (non-recursive). |
+
+`WATCHFILE`/`WATCHFOLDER` plug `FileSystemWatcher`-backed feeds into the existing RTD
+server; bursts of events are coalesced by the server's 250 ms throttle.
+
+### Result caching (`CacheUtilities.cs`)
+
+Stateful, so registered `IsThreadSafe = false`. Build content-addressed keys with the
+existing `EPT.HASHBLOCK`. Note Excel evaluates arguments before calling a UDF, so these
+store/return results for reuse - they do not prevent the inner formula from computing once.
+
+| Function | Signature | Description |
+| --- | --- | --- |
+| `EPT.MEMOIZE` | `(key, value) -> value` | Store a value in the session cache and return it (pass-through). |
+| `EPT.CACHE.GET` | `(key, [ifMissing]) -> object` | Read from the session cache. |
+| `EPT.CACHE.CLEAR` | `([key]) -> double` | Clear one key or all; returns count removed. |
+| `EPT.DISKCACHE.WRITE` | `(key, block) -> double` | Persist a block (survives reopen); returns row count. |
+| `EPT.DISKCACHE.READ` | `(key, [ifMissing]) -> object` | Load a persisted block. |
+| `EPT.DISKCACHE.CLEAR` | `([key]) -> double` | Delete one key or all; returns count removed. |
 
 ## Before and after: the one-crossing rule, demonstrated
 
@@ -366,6 +536,58 @@ The read is fully async under the hood, RFC 4180-compliant, and never
 touches `Workbooks`, `Application`, or any other COM surface. The result
 crosses the Excel boundary exactly once - on the bulk write into `Data!A1`.
 
+## Before and after: per-formula re-scan -> one-pass conditional aggregate
+
+### Before - a column of native SUMIFS (O(R*M))
+
+```
+' Filling C2:C100000, each SUMIFS re-scans A:A and B:B (M cells).
+' R formulas x M criteria cells = O(R*M), recomputed on every edit.
+C2: =SUMIFS($B$2:$B$100000, $A$2:$A$100000, ">"&D2)
+... copied down 100,000 rows ...
+```
+
+### After - one MTR-safe call per cell, fanned across cores
+
+```
+=EPT.SUMIFS($B$2:$B$100000, $A$2:$A$100000, ">"&D2)
+```
+
+Each call builds the match mask in one managed-memory pass and is
+`IsThreadSafe = true`, so Excel's multithreaded recalc engine schedules the
+whole column across cores. The same engine answers questions Excel cannot
+natively: a weighted average of matched rows in a single formula -
+
+```
+=EPT.WAVGIFS(Sales!Price, Sales!Qty, Sales!Region, "West", Sales!Year, 2025)
+```
+
+or a one-pass pivot that spills distinct keys with their aggregate -
+
+```
+=EPT.GROUPBY(Sales!Region, Sales!Revenue, "sum")
+```
+
+## Before and after: per-lookup re-scan -> one indexed pass
+
+### Before - a column of VLOOKUP (O(R*M))
+
+```
+' Each VLOOKUP re-scans the M-row table; R lookups = O(R*M).
+B2: =VLOOKUP(A2, Table!$A$2:$E$100000, 5, FALSE)
+... copied down R rows ...
+```
+
+### After - build the index once, probe it for the whole column
+
+```
+=EPT.XLOOKUPB(A2:A100000, Table!A2:A100000, Table!E2:E100000)
+```
+
+`EPT.XLOOKUPB` hashes the lookup column once, then resolves every key in
+O(M + R) total and spills the aligned results - exact match by default, or
+sorted-ascending approximate match with a trailing `FALSE`.
+
 ## Engineering standards
 
 - C# 12 on .NET 8 LTS, targeting `net8.0-windows`.
@@ -395,6 +617,17 @@ crosses the Excel boundary exactly once - on the bulk write into `Data!A1`.
 | `VectorizedKernels.cs` | **#4** (interpreted runtime, no JIT or SIMD) - compiled .NET kernels with `Vector<T>` and AVX2+FMA paths, runtime-checked scalar fallback. |
 | `RtdServer.cs` | **#5** (real-time feeds throttled through single-threaded marshaling) - multithreaded RTD server, concurrency-safe feed manager, throttled outbound updates. |
 | `DirectFileIO.cs` | **#6** (file I/O via the object model) - async streaming CSV/TSV through managed file streams, no workbook ever opened. |
+| `ConditionalAggregates.cs` | **#7** (conditional functions re-scan per formula) - one-pass match mask over bulk blocks, MTR-safe, plus the conditional aggregates and weighted statistics Excel lacks natively. |
+| `LookupBoost.cs` | **#8** (lookups re-scan the table per formula) - build the table index once, probe it for a whole column of lookup values in O(M+R). |
+| `TextUtilities.cs` | **#1**/**#2** - whole-block case, padding, repeat, reverse, and templated fill in pure managed memory. |
+| `RegexUtilities.cs` | **#1**/**#2** - block-wide regex match/count/extract/split with a per-cell ReDoS timeout. |
+| `SeriesUtilities.cs` | **#1**/**#2** - directional fill, outlier flagging, and quantiles over a whole block. |
+| `DateUtilities.cs` | **#1**/**#2** - vectorized working-day arithmetic with custom weekends and holidays. |
+| `DistanceUtilities.cs` | **#4** - pairwise distance matrices expressed through the SIMD dot-product kernel. |
+| `JsonUtilities.cs` | **#1**/**#2** (in-grid JSON extraction) and **#6** (async file read/write that never opens a workbook), on the in-box `System.Text.Json`. |
+| `FileSystemUtilities.cs` | **#6** - file metadata and folder ingest direct from `System.IO`; watch UDFs trigger recalcs from disk events. |
+| `WatchFeeds.cs` | **#5**/**#6** - `FileSystemWatcher` feeds for `WATCHFILE`/`WATCHFOLDER`, throttled through the RTD server. |
+| `CacheUtilities.cs` | Session and disk result caches so expensive blocks are stored once and reused across cells and sessions. |
 | `ToolkitLifetime.cs` | Shared shutdown `CancellationTokenSource` and `TraceSource` factory used by the second-wave files. |
 
 ## See also
