@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Globalization;
+using System.Runtime.InteropServices;
 using System.Text;
 using ExcelDna.Integration;
 
@@ -65,8 +67,8 @@ public static class ConditionalAggregates
         => Guard("EPT.COUNTIFS", () =>
         {
             var pairs = Combine(criteriaRange1, criteria1, morePairs);
-            var n = FlattenRowMajor(Marshaling.AsArray2D(criteriaRange1)).Length;
-            var mask = BuildMask(n, pairs);
+            var block = Marshaling.AsArray2D(criteriaRange1);
+            var mask = BuildMask(block.GetLength(0), block.GetLength(1), pairs);
             var count = 0;
             foreach (var m in mask)
             {
@@ -132,7 +134,32 @@ public static class ConditionalAggregates
         params object[] morePairs)
         => Guard("EPT.PERCENTILEIFS", () =>
         {
-            var nums = MatchedNumbers(valueRange, Combine(criteriaRange1, criteria1, morePairs));
+            var values = Marshaling.AsArray2D(valueRange);
+            var rows = values.GetLength(0);
+            var cols = values.GetLength(1);
+            var mask = BuildMask(rows, cols, Combine(criteriaRange1, criteria1, morePairs));
+            var nums = new List<double>();
+            var i = 0;
+            for (var r = 0; r < rows; r++)
+            {
+                for (var c = 0; c < cols; c++, i++)
+                {
+                    if (!mask[i])
+                    {
+                        continue;
+                    }
+                    var cell = values[r, c];
+                    if (cell is ExcelError err)
+                    {
+                        // Native Excel propagates an error from a matched value cell.
+                        return err;
+                    }
+                    if (IsNumericCell(cell, out var d))
+                    {
+                        nums.Add(d);
+                    }
+                }
+            }
             return PercentileInc(nums, k);
         });
 
@@ -243,6 +270,14 @@ public static class ConditionalAggregates
             var total = 0d;
             for (var i = 0; i < v.Length; i++)
             {
+                if (v[i] is ExcelError ve)
+                {
+                    return ve;
+                }
+                if (w[i] is ExcelError we)
+                {
+                    return we;
+                }
                 if (IsNumericCell(v[i], out var x) && IsNumericCell(w[i], out var wt) && wt > 0d)
                 {
                     pairs.Add((x, wt));
@@ -283,11 +318,23 @@ public static class ConditionalAggregates
             {
                 return ExcelError.ExcelErrorValue;
             }
+            // Collect the typed pairs once: the second pass must not re-run the 10-branch
+            // TryToDouble dispatch (4 conversions per row where 2 suffice).
+            var kept = new List<(double X, double W)>();
             double sumW = 0d, sumWx = 0d;
             for (var i = 0; i < v.Length; i++)
             {
+                if (v[i] is ExcelError ve)
+                {
+                    return ve;
+                }
+                if (w[i] is ExcelError we)
+                {
+                    return we;
+                }
                 if (IsNumericCell(v[i], out var x) && IsNumericCell(w[i], out var wt) && wt > 0d)
                 {
+                    kept.Add((x, wt));
                     sumW += wt;
                     sumWx += wt * x;
                 }
@@ -298,13 +345,10 @@ public static class ConditionalAggregates
             }
             var mean = sumWx / sumW;
             var sumWss = 0d;
-            for (var i = 0; i < v.Length; i++)
+            foreach (var (x, wt) in kept)
             {
-                if (IsNumericCell(v[i], out var x) && IsNumericCell(w[i], out var wt) && wt > 0d)
-                {
-                    var d = x - mean;
-                    sumWss += wt * d * d;
-                }
+                var d = x - mean;
+                sumWss += wt * d * d;
             }
             return Math.Sqrt(sumWss / sumW);
         });
@@ -329,17 +373,30 @@ public static class ConditionalAggregates
         params object[] morePairs)
         => Guard("EPT.SUMPRODUCTIFS", () =>
         {
-            var a = FlattenRowMajor(Marshaling.AsArray2D(rangeA));
+            var aBlock = Marshaling.AsArray2D(rangeA);
+            var a = FlattenRowMajor(aBlock);
             var b = FlattenRowMajor(Marshaling.AsArray2D(rangeB));
             if (a.Length != b.Length)
             {
                 return ExcelError.ExcelErrorValue;
             }
-            var mask = BuildMask(a.Length, Combine(criteriaRange1, criteria1, morePairs));
+            var mask = BuildMask(aBlock.GetLength(0), aBlock.GetLength(1), Combine(criteriaRange1, criteria1, morePairs));
             var sum = 0d;
             for (var i = 0; i < a.Length; i++)
             {
-                if (mask[i] && IsNumericCell(a[i], out var x) && IsNumericCell(b[i], out var y))
+                if (!mask[i])
+                {
+                    continue;
+                }
+                if (a[i] is ExcelError ea)
+                {
+                    return ea;
+                }
+                if (b[i] is ExcelError eb)
+                {
+                    return eb;
+                }
+                if (IsNumericCell(a[i], out var x) && IsNumericCell(b[i], out var y))
                 {
                     sum += x * y;
                 }
@@ -382,25 +439,34 @@ public static class ConditionalAggregates
                 return ExcelError.ExcelErrorValue;
             }
 
+            // Normalize the operation once, not once per group in the result loop.
+            var op = (operation ?? string.Empty).Trim().ToLowerInvariant();
+
+            // Text keys group case-insensitively (Excel's text equality), matching the
+            // "distinct" aggregate's policy; the displayed key keeps first-seen casing.
             var order = new List<string>();
-            var groups = new Dictionary<string, List<object?>>(StringComparer.Ordinal);
-            var keyCells = new Dictionary<string, object?[]>(StringComparer.Ordinal);
+            var groups = new Dictionary<string, List<object?>>(StringComparer.OrdinalIgnoreCase);
+            var keyCells = new Dictionary<string, object?[]>(StringComparer.OrdinalIgnoreCase);
             var sb = new StringBuilder();
             for (var r = 0; r < keyRows; r++)
             {
                 sb.Clear();
-                var keyRow = new object?[keyCols];
                 for (var c = 0; c < keyCols; c++)
                 {
-                    var cell = keys[r, c];
-                    keyRow[c] = cell;
-                    sb.Append(Marshaling.ToStringSafe(cell)).Append('\u001f');
+                    AppendCellKey(sb, keys[r, c]);
                 }
                 var key = sb.ToString();
                 if (!groups.TryGetValue(key, out var list))
                 {
                     list = new List<object?>();
                     groups[key] = list;
+                    // The display row is only retained for first-seen keys; allocating it
+                    // per input row would be rows-many wasted arrays.
+                    var keyRow = new object?[keyCols];
+                    for (var c = 0; c < keyCols; c++)
+                    {
+                        keyRow[c] = keys[r, c];
+                    }
                     keyCells[key] = keyRow;
                     order.Add(key);
                 }
@@ -416,7 +482,7 @@ public static class ConditionalAggregates
                 {
                     result[i, c] = cells[c] ?? ExcelEmpty.Value;
                 }
-                result[i, keyCols] = Aggregate(operation, groups[key]);
+                result[i, keyCols] = Aggregate(op, groups[key]);
             }
             return result;
         });
@@ -426,14 +492,16 @@ public static class ConditionalAggregates
     // ====================================================================
 
     /// <summary>
-    /// Applies a named aggregation to a list of matched cell values. Numeric aggregations
-    /// extract the genuinely-numeric cells (numeric-looking text is ignored, as in Excel).
-    /// Returns a boxed <see cref="double"/>, an original cell value (<c>first</c>/<c>last</c>),
-    /// or an <see cref="ExcelError"/> sentinel for empty / undefined cases.
+    /// Applies a named aggregation to a list of matched cell values. The operation name
+    /// must already be trimmed and lower-cased (callers normalize once per call). Numeric
+    /// aggregations extract the genuinely-numeric cells (numeric-looking text and logicals
+    /// are ignored, as in Excel) and propagate an <see cref="ExcelError"/> found in a
+    /// matched cell, as native SUMIFS/AVERAGEIFS do. Returns a boxed <see cref="double"/>,
+    /// an original cell value (<c>first</c>/<c>last</c>), or an <see cref="ExcelError"/>
+    /// sentinel for empty / undefined cases.
     /// </summary>
-    private static object Aggregate(string operation, IReadOnlyList<object?> cells)
+    private static object Aggregate(string op, IReadOnlyList<object?> cells)
     {
-        var op = (operation ?? string.Empty).Trim().ToLowerInvariant();
         switch (op)
         {
             case "count":
@@ -442,13 +510,16 @@ public static class ConditionalAggregates
             case "distinctcount":
             {
                 var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                var keyBuilder = new StringBuilder();
                 foreach (var c in cells)
                 {
                     if (IsBlank(c) || c is ExcelError)
                     {
                         continue;
                     }
-                    set.Add(Marshaling.ToStringSafe(c));
+                    keyBuilder.Clear();
+                    AppendCellKey(keyBuilder, c);
+                    set.Add(keyBuilder.ToString());
                 }
                 return (double)set.Count;
             }
@@ -476,6 +547,13 @@ public static class ConditionalAggregates
         var nums = new List<double>(cells.Count);
         foreach (var c in cells)
         {
+            // Native Excel propagates an error from a matched value cell for the numeric
+            // aggregates (SUMIFS over a matched #DIV/0! returns #DIV/0!); count/first/
+            // last/distinct above define their own skip semantics.
+            if (c is ExcelError err)
+            {
+                return err;
+            }
             if (IsNumericCell(c, out var d))
             {
                 nums.Add(d);
@@ -551,57 +629,56 @@ public static class ConditionalAggregates
             case "harmean":
                 return HarMean(nums);
             default:
-                throw new ArgumentException($"Unknown aggregation '{operation}'. See EPT.GROUPBY help for the supported list.");
+                throw new ArgumentException($"Unknown aggregation '{op}'. See EPT.GROUPBY help for the supported list.");
         }
     }
 
     /// <summary>Collects the matched value cells, then defers to <see cref="Aggregate"/>.</summary>
     private static object AggregateIfs(string op, object valueRange, object[] pairs)
     {
-        var values = FlattenRowMajor(Marshaling.AsArray2D(valueRange));
-        var mask = BuildMask(values.Length, pairs);
-        var matched = new List<object?>(values.Length);
-        for (var i = 0; i < values.Length; i++)
+        var values = Marshaling.AsArray2D(valueRange);
+        var rows = values.GetLength(0);
+        var cols = values.GetLength(1);
+        var mask = BuildMask(rows, cols, pairs);
+        var matched = new List<object?>();
+        var i = 0;
+        for (var r = 0; r < rows; r++)
         {
-            if (mask[i])
+            for (var c = 0; c < cols; c++, i++)
             {
-                matched.Add(values[i]);
+                if (mask[i])
+                {
+                    matched.Add(values[r, c]);
+                }
             }
         }
         return Aggregate(op, matched);
     }
 
-    /// <summary>Returns the genuinely-numeric matched values for the percentile path.</summary>
-    private static List<double> MatchedNumbers(object valueRange, object[] pairs)
-    {
-        var values = FlattenRowMajor(Marshaling.AsArray2D(valueRange));
-        var mask = BuildMask(values.Length, pairs);
-        var nums = new List<double>(values.Length);
-        for (var i = 0; i < values.Length; i++)
-        {
-            if (mask[i] && IsNumericCell(values[i], out var d))
-            {
-                nums.Add(d);
-            }
-        }
-        return nums;
-    }
-
     private static object WeightedAverage(object valueRange, object weightRange, object[]? pairs)
     {
-        var v = FlattenRowMajor(Marshaling.AsArray2D(valueRange));
+        var vBlock = Marshaling.AsArray2D(valueRange);
+        var v = FlattenRowMajor(vBlock);
         var w = FlattenRowMajor(Marshaling.AsArray2D(weightRange));
         if (v.Length != w.Length)
         {
             return ExcelError.ExcelErrorValue;
         }
-        var mask = pairs is null ? null : BuildMask(v.Length, pairs);
+        var mask = pairs is null ? null : BuildMask(vBlock.GetLength(0), vBlock.GetLength(1), pairs);
         double sumW = 0d, sumWx = 0d;
         for (var i = 0; i < v.Length; i++)
         {
             if (mask is not null && !mask[i])
             {
                 continue;
+            }
+            if (v[i] is ExcelError ve)
+            {
+                return ve;
+            }
+            if (w[i] is ExcelError we)
+            {
+                return we;
             }
             if (IsNumericCell(v[i], out var x) && IsNumericCell(w[i], out var wt))
             {
@@ -617,33 +694,64 @@ public static class ConditionalAggregates
     // ====================================================================
 
     /// <summary>
-    /// Builds the per-element AND of every criterion. Each pair is a (criteria range,
-    /// criteria scalar); the range must hold exactly <paramref name="n"/> cells.
+    /// Builds the per-element AND of every criterion, iterating the criteria blocks in
+    /// place (no flattened copies). Each pair is a (criteria range, criteria scalar); the
+    /// range must have exactly the value range's shape, as native COUNTIFS/SUMIFS require.
     /// </summary>
-    private static bool[] BuildMask(int n, object[] pairs)
+    private static bool[] BuildMask(int rows, int cols, object[] pairs)
     {
         if (pairs.Length % 2 != 0)
         {
             throw new ArgumentException("Criteria must be supplied as (range, criteria) pairs.");
         }
-        var mask = new bool[n];
-        for (var i = 0; i < n; i++)
+        var total = (long)rows * cols;
+        if (total > int.MaxValue)
         {
-            mask[i] = true;
+            throw new ArgumentException($"Block too large: {rows}x{cols} = {total} cells exceeds Int32.MaxValue.");
         }
+        var n = (int)total;
+        var mask = new bool[n];
+        Array.Fill(mask, true);
         for (var p = 0; p < pairs.Length; p += 2)
         {
-            var range = FlattenRowMajor(Marshaling.AsArray2D(pairs[p]));
-            if (range.Length != n)
+            var range = Marshaling.AsArray2D(pairs[p]);
+            if (range.GetLength(0) != rows || range.GetLength(1) != cols)
             {
-                throw new ArgumentException($"Criteria range has {range.Length} cells but the value range has {n}.");
+                throw new ArgumentException(
+                    $"Criteria range is {range.GetLength(0)}x{range.GetLength(1)} but the value range is {rows}x{cols}; shapes must match.");
             }
             var criterion = Criterion.Parse(pairs[p + 1]);
-            for (var i = 0; i < n; i++)
+            var i = 0;
+            if (criterion.IsPlainNumeric)
             {
-                if (mask[i] && !criterion.Matches(range[i]))
+                // Fast path for the dominant shape: a plain numeric criterion over a
+                // numeric column. `is double` + an inlined compare skips the layered
+                // blank/error/type dispatch; anything that isn't a raw double falls back
+                // to the general matcher so semantics stay identical.
+                for (var r = 0; r < rows; r++)
                 {
-                    mask[i] = false;
+                    for (var c = 0; c < cols; c++, i++)
+                    {
+                        if (!mask[i])
+                        {
+                            continue;
+                        }
+                        var cell = range[r, c];
+                        mask[i] = cell is double d ? criterion.MatchesNumber(d) : criterion.Matches(cell);
+                    }
+                }
+            }
+            else
+            {
+                for (var r = 0; r < rows; r++)
+                {
+                    for (var c = 0; c < cols; c++, i++)
+                    {
+                        if (mask[i] && !criterion.Matches(range[r, c]))
+                        {
+                            mask[i] = false;
+                        }
+                    }
                 }
             }
         }
@@ -720,11 +828,25 @@ public static class ConditionalAggregates
         private readonly Op _op;
         private readonly bool _emptyOperand;
         private readonly bool _isNumeric;
+        private readonly bool _isBool;
+        private readonly bool _isError;
+        private readonly bool _boolValue;
+        private readonly ExcelError _errorValue;
         private readonly double _number;
         private readonly string _text;
         private readonly Tok[] _tokens;
 
-        private Criterion(Op op, bool emptyOperand, bool isNumeric, double number, string text, Tok[] tokens)
+        private Criterion(
+            Op op,
+            bool emptyOperand,
+            bool isNumeric,
+            double number,
+            string text,
+            Tok[] tokens,
+            bool isBool = false,
+            bool boolValue = false,
+            bool isError = false,
+            ExcelError errorValue = default)
         {
             _op = op;
             _emptyOperand = emptyOperand;
@@ -732,7 +854,14 @@ public static class ConditionalAggregates
             _number = number;
             _text = text;
             _tokens = tokens;
+            _isBool = isBool;
+            _boolValue = boolValue;
+            _isError = isError;
+            _errorValue = errorValue;
         }
+
+        /// <summary>True for a plain numeric comparison; enables the fast mask loop.</summary>
+        public bool IsPlainNumeric => _isNumeric;
 
         public static Criterion Parse(object? criteria)
         {
@@ -743,10 +872,23 @@ public static class ConditionalAggregates
                 case ExcelMissing:
                     return new Criterion(Op.Equal, emptyOperand: true, false, 0d, string.Empty, Array.Empty<Tok>());
                 case bool b:
-                    return new Criterion(Op.Equal, false, true, b ? 1d : 0d, string.Empty, Array.Empty<Tok>());
+                    // Excel keeps logicals a distinct type: criterion TRUE matches TRUE
+                    // cells, never numeric 1 (and vice versa).
+                    return new Criterion(Op.Equal, false, false, 0d, string.Empty, Array.Empty<Tok>(), isBool: true, boolValue: b);
+                case ExcelError ce:
+                    return new Criterion(Op.Equal, false, false, 0d, string.Empty, Array.Empty<Tok>(), isError: true, errorValue: ce);
                 case double or int or long or float or decimal or DateTime:
                     Marshaling.TryToDouble(criteria, out var dn);
                     return new Criterion(Op.Equal, false, true, dn, string.Empty, Array.Empty<Tok>());
+                case object[,] block:
+                    if (block.Length == 1)
+                    {
+                        return Parse(block[0, 0]);
+                    }
+                    // Without this, ToStringSafe would render the array as the literal
+                    // text "System.Object[,]" and the criterion would silently match
+                    // nothing.
+                    throw new ArgumentException("criteria must be a single value, not a multi-cell range.");
             }
 
             var s = Marshaling.ToStringSafe(criteria);
@@ -792,13 +934,87 @@ public static class ConditionalAggregates
             {
                 return new Criterion(op, false, true, num, operand, Array.Empty<Tok>());
             }
+            if ((op == Op.Equal || op == Op.NotEqual) && TryParseErrorText(operand, out var errVal))
+            {
+                // Native COUNTIF matches error cells by their textual form
+                // (=COUNTIF(rng,"#DIV/0!") counts #DIV/0! cells).
+                return new Criterion(op, false, false, 0d, operand, Array.Empty<Tok>(), isError: true, errorValue: errVal);
+            }
+            if (TryParseDateLiteral(operand, out var serial))
+            {
+                // Native Excel parses date/time-literal operands (">1/1/2025") into
+                // serials and compares numerically; without this the criterion degrades
+                // to an ordinal STRING comparison against the serial's text form, which
+                // matches essentially every date.
+                return new Criterion(op, false, true, serial, operand, Array.Empty<Tok>());
+            }
             return new Criterion(op, false, false, 0d, operand, Tokenize(operand));
+        }
+
+        private static bool TryParseErrorText(string s, out ExcelError err)
+        {
+            switch (s.ToUpperInvariant())
+            {
+                case "#DIV/0!": err = ExcelError.ExcelErrorDiv0; return true;
+                case "#N/A": err = ExcelError.ExcelErrorNA; return true;
+                case "#NAME?": err = ExcelError.ExcelErrorName; return true;
+                case "#NULL!": err = ExcelError.ExcelErrorNull; return true;
+                case "#NUM!": err = ExcelError.ExcelErrorNum; return true;
+                case "#REF!": err = ExcelError.ExcelErrorRef; return true;
+                case "#VALUE!": err = ExcelError.ExcelErrorValue; return true;
+                case "#GETTING_DATA": err = ExcelError.ExcelErrorGettingData; return true;
+                default: err = default; return false;
+            }
+        }
+
+        private static bool TryParseDateLiteral(string operand, out double serial)
+        {
+            serial = 0d;
+            // Require at least one digit so month names alone ("March") stay text
+            // criteria; locale-dependent parsing mirrors how Excel itself interprets
+            // date-literal criteria per locale.
+            var hasDigit = false;
+            foreach (var ch in operand)
+            {
+                if (char.IsAsciiDigit(ch))
+                {
+                    hasDigit = true;
+                    break;
+                }
+            }
+            if (!hasDigit)
+            {
+                return false;
+            }
+            if (!DateTime.TryParse(operand, CultureInfo.CurrentCulture, DateTimeStyles.NoCurrentDateDefault, out var dt))
+            {
+                return false;
+            }
+            if (dt.Date == DateTime.MinValue.Date)
+            {
+                // Time-only literal ("13:30"): Excel time criteria are day fractions.
+                serial = dt.TimeOfDay.TotalDays;
+                return true;
+            }
+            try
+            {
+                serial = dt.ToOADate();
+                return true;
+            }
+            catch (OverflowException)
+            {
+                return false;
+            }
         }
 
         public bool Matches(object? cell)
         {
-            if (cell is ExcelError)
+            if (cell is ExcelError cellErr)
             {
+                if (_isError)
+                {
+                    return _op == Op.NotEqual ? cellErr != _errorValue : cellErr == _errorValue;
+                }
                 return false;
             }
             var blank = IsBlank(cell);
@@ -808,7 +1024,23 @@ public static class ConditionalAggregates
             }
             if (blank)
             {
-                return false;
+                // Native Excel counts blanks for "<>x": a blank cell is "not x" for any
+                // non-empty operand, numeric or textual.
+                return _op == Op.NotEqual;
+            }
+            if (_isError)
+            {
+                // An error criterion matches only error cells; "<>#N/A" is satisfied by
+                // any non-error cell.
+                return _op == Op.NotEqual;
+            }
+            if (_isBool)
+            {
+                if (cell is bool cb)
+                {
+                    return _op == Op.NotEqual ? cb != _boolValue : cb == _boolValue;
+                }
+                return _op == Op.NotEqual;
             }
 
             if (_isNumeric)
@@ -819,19 +1051,16 @@ public static class ConditionalAggregates
                     // satisfied by everything that is not that number, including text.
                     return _op == Op.NotEqual;
                 }
-                return _op switch
-                {
-                    Op.Equal => d == _number,
-                    Op.NotEqual => d != _number,
-                    Op.Greater => d > _number,
-                    Op.Less => d < _number,
-                    Op.GreaterEqual => d >= _number,
-                    Op.LessEqual => d <= _number,
-                    _ => false,
-                };
+                return MatchesNumber(d);
             }
 
-            var text = Marshaling.ToStringSafe(cell);
+            // Text/wildcard criteria match text cells only, as native Excel does:
+            // COUNTIF(range,"*") never counts numbers or logicals. "<>text" is satisfied
+            // by any non-text cell.
+            if (cell is not string text)
+            {
+                return _op == Op.NotEqual;
+            }
             if (_op == Op.Equal)
             {
                 return WildcardMatch(_tokens, text);
@@ -876,6 +1105,29 @@ public static class ConditionalAggregates
                 }
             }
             return tokens.ToArray();
+        }
+
+        /// <summary>
+        /// The numeric comparison core, callable directly by the fast mask loop for raw
+        /// <see cref="double"/> cells. Semantics identical to the numeric branch of
+        /// <see cref="Matches"/>.
+        /// </summary>
+        public bool MatchesNumber(double d)
+        {
+            if (!double.IsFinite(d))
+            {
+                return _op == Op.NotEqual;
+            }
+            return _op switch
+            {
+                Op.Equal => d == _number,
+                Op.NotEqual => d != _number,
+                Op.Greater => d > _number,
+                Op.Less => d < _number,
+                Op.GreaterEqual => d >= _number,
+                Op.LessEqual => d <= _number,
+                _ => false,
+            };
         }
 
         private static bool WildcardMatch(Tok[] tokens, string text)
@@ -934,11 +1186,13 @@ public static class ConditionalAggregates
 
     private static double Median(List<double> nums)
     {
-        var arr = nums.ToArray();
-        Array.Sort(arr);
-        var n = arr.Length;
+        // The list is always a freshly built scratch collection: sort it in place
+        // instead of paying a ToArray copy.
+        var span = CollectionsMarshal.AsSpan(nums);
+        span.Sort();
+        var n = span.Length;
         var mid = n / 2;
-        return (n & 1) == 1 ? arr[mid] : (arr[mid - 1] + arr[mid]) / 2d;
+        return (n & 1) == 1 ? span[mid] : (span[mid - 1] + span[mid]) / 2d;
     }
 
     private static object PercentileInc(List<double> nums, double k)
@@ -947,21 +1201,21 @@ public static class ConditionalAggregates
         {
             return ExcelError.ExcelErrorNum;
         }
-        var arr = nums.ToArray();
-        Array.Sort(arr);
-        if (arr.Length == 1)
+        var span = CollectionsMarshal.AsSpan(nums);
+        span.Sort();
+        if (span.Length == 1)
         {
-            return arr[0];
+            return span[0];
         }
-        var rank = k * (arr.Length - 1);
+        var rank = k * (span.Length - 1);
         var lo = (int)Math.Floor(rank);
         var hi = (int)Math.Ceiling(rank);
         if (lo == hi)
         {
-            return arr[lo];
+            return span[lo];
         }
         var frac = rank - lo;
-        return arr[lo] + ((arr[hi] - arr[lo]) * frac);
+        return span[lo] + ((span[hi] - span[lo]) * frac);
     }
 
     private static double Variance(List<double> nums, bool sample)
@@ -1054,18 +1308,70 @@ public static class ConditionalAggregates
         => v is null or ExcelEmpty or ExcelMissing || (v is string s && s.Length == 0);
 
     /// <summary>
-    /// True only for genuinely numeric cells (number, bool, date serial). Numeric-looking
-    /// <see cref="string"/> cells are deliberately excluded so criteria and value handling
-    /// match Excel, which treats <c>"5"</c> as text.
+    /// True only for genuinely numeric cells (number, date serial). Numeric-looking
+    /// <see cref="string"/> cells and logicals are deliberately excluded so criteria and
+    /// value handling match Excel, which treats <c>"5"</c> as text and keeps <c>TRUE</c>
+    /// a distinct type (native SUMIFS ignores logicals in the sum range; <c>COUNTIF(rng,
+    /// 1)</c> does not count TRUE).
     /// </summary>
     private static bool IsNumericCell(object? v, out double d)
     {
-        if (v is string)
+        if (v is string or bool)
         {
             d = 0d;
             return false;
         }
         return Marshaling.TryToDouble(v, out d);
+    }
+
+    /// <summary>
+    /// Appends an injective, type-tagged encoding of a cell to a composite-key builder:
+    /// <c>{tag}{length}:{text}</c>. The tag keeps numbers, text, bools, errors, and blanks
+    /// in disjoint keyspaces (numeric 5 never merges with text "5"); the length prefix
+    /// makes concatenation injective, closing the separator-collision class fixed in
+    /// round 2 as U-02/U-03.
+    /// </summary>
+    private static void AppendCellKey(StringBuilder sb, object? cell)
+    {
+        char tag;
+        string text;
+        switch (cell)
+        {
+            case null:
+            case ExcelEmpty:
+            case ExcelMissing:
+            case string { Length: 0 }:
+                // Blank and zero-length text intentionally share a key, preserving the
+                // pre-existing grouping behavior for empty cells.
+                tag = '_';
+                text = string.Empty;
+                break;
+            case bool b:
+                tag = 'B';
+                text = b ? "1" : "0";
+                break;
+            case ExcelError err:
+                tag = 'E';
+                text = ((int)err).ToString(CultureInfo.InvariantCulture);
+                break;
+            case string s:
+                tag = 'S';
+                text = s;
+                break;
+            default:
+                if (Marshaling.TryToDouble(cell, out var d))
+                {
+                    tag = 'N';
+                    text = d.ToString("R", CultureInfo.InvariantCulture);
+                }
+                else
+                {
+                    tag = 'S';
+                    text = Marshaling.ToStringSafe(cell);
+                }
+                break;
+        }
+        sb.Append(tag).Append(text.Length).Append(':').Append(text);
     }
 
     /// <summary>
