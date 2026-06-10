@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Runtime.InteropServices;
 using ExcelDna.Integration;
 
 namespace ExcelPerfToolkit;
@@ -115,33 +116,50 @@ public static class SeriesUtilities
         var rows = block.GetLength(0);
         var cols = block.GetLength(1);
 
-        var values = new List<double>(rows * cols);
+        // Parse every cell exactly once: the flagging pass below reads the cached
+        // values instead of re-running TryToDouble (a second full string re-parse on
+        // text-numeric blocks).
+        var n = rows * cols;
+        var vals = new double[n];
+        var ok = new bool[n];
+        var count = 0;
+        var idx = 0;
         for (var r = 0; r < rows; r++)
         {
-            for (var c = 0; c < cols; c++)
+            for (var c = 0; c < cols; c++, idx++)
             {
                 if (Marshaling.TryToDouble(block[r, c], out var d))
                 {
-                    values.Add(d);
+                    vals[idx] = d;
+                    ok[idx] = true;
+                    count++;
                 }
             }
         }
 
         Func<double, bool> isOutlier;
-        if (values.Count < 2)
+        if (count < 2)
         {
             isOutlier = static _ => false;
         }
         else
         {
+            var nums = new double[count];
+            var k2 = 0;
+            for (var i = 0; i < n; i++)
+            {
+                if (ok[i])
+                {
+                    nums[k2++] = vals[i];
+                }
+            }
             switch (m)
             {
                 case "iqr":
                 {
-                    var sorted = values.ToArray();
-                    Array.Sort(sorted);
-                    var q1 = PercentileSorted(sorted, 0.25);
-                    var q3 = PercentileSorted(sorted, 0.75);
+                    Array.Sort(nums);
+                    var q1 = PercentileSorted(nums, 0.25);
+                    var q3 = PercentileSorted(nums, 0.75);
                     var iqr = q3 - q1;
                     var k = threshold > 0d ? threshold : 1.5;
                     var lower = q1 - (k * iqr);
@@ -151,7 +169,7 @@ public static class SeriesUtilities
                 }
                 case "zscore":
                 {
-                    var (mean, std) = MeanStd(values, sample: true);
+                    var (mean, std) = MeanStd(nums, sample: true);
                     var k = threshold > 0d ? threshold : 3d;
                     if (std <= 0d)
                     {
@@ -165,16 +183,16 @@ public static class SeriesUtilities
                 }
                 case "mad":
                 {
-                    var sorted = values.ToArray();
-                    Array.Sort(sorted);
-                    var median = PercentileSorted(sorted, 0.5);
-                    var deviations = new double[values.Count];
-                    for (var i = 0; i < values.Count; i++)
+                    Array.Sort(nums);
+                    var median = PercentileSorted(nums, 0.5);
+                    // The deviation multiset doesn't depend on order, so overwrite the
+                    // sorted buffer in place instead of allocating a second array.
+                    for (var i = 0; i < nums.Length; i++)
                     {
-                        deviations[i] = Math.Abs(values[i] - median);
+                        nums[i] = Math.Abs(nums[i] - median);
                     }
-                    Array.Sort(deviations);
-                    var mad = PercentileSorted(deviations, 0.5);
+                    Array.Sort(nums);
+                    var mad = PercentileSorted(nums, 0.5);
                     var k = threshold > 0d ? threshold : 3d;
                     if (mad <= 0d)
                     {
@@ -192,11 +210,12 @@ public static class SeriesUtilities
         }
 
         var result = new object[rows, cols];
+        idx = 0;
         for (var r = 0; r < rows; r++)
         {
-            for (var c = 0; c < cols; c++)
+            for (var c = 0; c < cols; c++, idx++)
             {
-                result[r, c] = Marshaling.TryToDouble(block[r, c], out var d) && isOutlier(d);
+                result[r, c] = ok[idx] && isOutlier(vals[idx]);
             }
         }
         return result;
@@ -232,8 +251,8 @@ public static class SeriesUtilities
                 }
             }
         }
-        var sorted = values.ToArray();
-        Array.Sort(sorted);
+        var sorted = CollectionsMarshal.AsSpan(values);
+        sorted.Sort();
 
         var pr = probabilities.GetLength(0);
         var pc = probabilities.GetLength(1);
@@ -262,9 +281,9 @@ public static class SeriesUtilities
     private static bool IsCellBlank(object? v)
         => v is null or ExcelEmpty or ExcelMissing || (v is string s && s.Length == 0);
 
-    private static (double Mean, double Std) MeanStd(List<double> values, bool sample)
+    private static (double Mean, double Std) MeanStd(ReadOnlySpan<double> values, bool sample)
     {
-        var n = values.Count;
+        var n = values.Length;
         var sum = 0d;
         foreach (var v in values)
         {
@@ -282,8 +301,8 @@ public static class SeriesUtilities
         return (mean, std);
     }
 
-    /// <summary>Inclusive percentile (PERCENTILE.INC) of an ascending-sorted array.</summary>
-    private static double PercentileSorted(double[] sortedAsc, double p)
+    /// <summary>Inclusive percentile (PERCENTILE.INC) of an ascending-sorted sequence.</summary>
+    private static double PercentileSorted(ReadOnlySpan<double> sortedAsc, double p)
     {
         if (sortedAsc.Length == 1)
         {

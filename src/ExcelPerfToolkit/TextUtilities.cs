@@ -33,7 +33,10 @@ public static class TextUtilities
     /// </summary>
     [ExcelFunction(Name = "EPT.PROPER", Description = "Proper-case every string cell in a block (first letter of each word upper, rest lower).", Category = "EPT.Text", IsThreadSafe = true, IsVolatile = false)]
     public static object[,] Proper(object[,] block)
-        => MapCells(block, c => c is string s ? ToProper(s) : (c ?? ExcelEmpty.Value));
+    {
+        var sb = new StringBuilder();
+        return MapCells(block, c => c is string s ? ToProper(s, sb) : (c ?? ExcelEmpty.Value));
+    }
 
     /// <summary>
     /// Title-cases every string cell using the invariant culture's title-casing, which - unlike
@@ -52,7 +55,10 @@ public static class TextUtilities
     /// </summary>
     [ExcelFunction(Name = "EPT.CAMELCASE", Description = "Convert every string cell to camelCase (drops separators).", Category = "EPT.Text", IsThreadSafe = true, IsVolatile = false)]
     public static object[,] CamelCase(object[,] block)
-        => MapCells(block, c => c is string s ? ToCamel(s) : (c ?? ExcelEmpty.Value));
+    {
+        var sb = new StringBuilder();
+        return MapCells(block, c => c is string s ? ToCamel(s, sb) : (c ?? ExcelEmpty.Value));
+    }
 
     // ---------- Padding ----------
 
@@ -107,18 +113,23 @@ public static class TextUtilities
 
     /// <summary>
     /// Repeats the text form of every non-blank cell <paramref name="count"/> times. A result
-    /// that would exceed the 32,767-character cell limit throws (surfaced as <c>#VALUE!</c>).
+    /// that would exceed the 32,767-character cell limit throws (surfaced as <c>#VALUE!</c>),
+    /// as does a <paramref name="count"/> above that limit (it could never fit anyway).
     /// Blank and error cells pass through.
     /// Marshaling cost: O(1). Thread-safety: SAFE for MTR.
     /// </summary>
     [ExcelFunction(Name = "EPT.REPEAT", Description = "Repeat each cell's text N times.", Category = "EPT.Text", IsThreadSafe = true, IsVolatile = false)]
     public static object[,] Repeat(object[,] block, [ExcelArgument(Name = "count")] double count)
     {
-        if (double.IsNaN(count) || count < 0d || count != Math.Truncate(count))
+        // The upper bound must precede the int cast: an out-of-int-range double converts
+        // to int.MinValue, which slips past the per-cell length guard as a negative
+        // product and silently returns "" for even-length cells.
+        if (double.IsNaN(count) || count < 0d || count != Math.Truncate(count) || count > MaxCellChars)
         {
-            throw new ArgumentException("count must be a non-negative integer.", nameof(count));
+            throw new ArgumentException($"count must be an integer between 0 and {MaxCellChars}.", nameof(count));
         }
         var n = (int)count;
+        var sb = new StringBuilder();
         return MapCells(block, c =>
         {
             if (IsBlankCell(c))
@@ -130,7 +141,7 @@ public static class TextUtilities
             {
                 throw new ArgumentException($"Repeated string exceeds the {MaxCellChars}-character cell limit.");
             }
-            var sb = new StringBuilder(n * s.Length);
+            sb.Clear();
             for (var i = 0; i < n; i++)
             {
                 sb.Append(s);
@@ -140,9 +151,9 @@ public static class TextUtilities
     }
 
     /// <summary>
-    /// Reverses the characters of every non-blank cell's text. Reversal is by UTF-16 code
-    /// unit; surrogate-pair characters (some emoji) are not preserved. Blank and error cells
-    /// pass through.
+    /// Reverses the characters of every non-blank cell's text. Surrogate pairs (emoji,
+    /// supplementary-plane letters) are kept intact; combining marks reorder relative to
+    /// their base character. Blank and error cells pass through.
     /// Marshaling cost: O(1). Thread-safety: SAFE for MTR.
     /// </summary>
     [ExcelFunction(Name = "EPT.REVERSE", Description = "Reverse the characters of each cell's text.", Category = "EPT.Text", IsThreadSafe = true, IsVolatile = false)]
@@ -153,9 +164,27 @@ public static class TextUtilities
             {
                 return c ?? ExcelEmpty.Value;
             }
-            var chars = Marshaling.ToStringSafe(c).ToCharArray();
-            Array.Reverse(chars);
-            return new string(chars);
+            return ReverseString(Marshaling.ToStringSafe(c));
+        });
+
+    private static string ReverseString(string s)
+        => string.Create(s.Length, s, static (dst, src) =>
+        {
+            for (var i = 0; i < dst.Length; i++)
+            {
+                dst[i] = src[src.Length - 1 - i];
+            }
+            // A plain code-unit reversal flips every surrogate pair into (low, high)
+            // order - ill-formed UTF-16 that turns into U+FFFD on any UTF-8 hop.
+            // Re-swap the reversed pairs.
+            for (var i = 0; i < dst.Length - 1; i++)
+            {
+                if (char.IsLowSurrogate(dst[i]) && char.IsHighSurrogate(dst[i + 1]))
+                {
+                    (dst[i], dst[i + 1]) = (dst[i + 1], dst[i]);
+                    i++;
+                }
+            }
         });
 
     // ---------- Template fill ----------
@@ -173,16 +202,21 @@ public static class TextUtilities
     public static object[,] TemplateFill(
         [ExcelArgument(Name = "template", Description = "Template text with {name} or {index} placeholders.")] string template,
         [ExcelArgument(Name = "data", Description = "Data block; row 0 holds header names when has_header_row is TRUE.")] object[,] data,
-        [ExcelArgument(Name = "has_header_row", Description = "TRUE (default) treats row 0 as header names.")] bool hasHeaderRow = true)
+        [ExcelArgument(Name = "has_header_row", Description = "TRUE (default) treats row 0 as header names.")] object hasHeaderRow)
     {
         ArgumentNullException.ThrowIfNull(data);
         template ??= string.Empty;
         var rows = data.GetLength(0);
         var cols = data.GetLength(1);
 
+        // Excel-DNA's built-in registration ignores C# default parameter values: an
+        // omitted bool argument arrives as xltypeMissing and would marshal to FALSE.
+        // Take the flag as object and decode it so the documented TRUE default is real.
+        var useHeader = ResolveBool(hasHeaderRow, defaultValue: true);
+
         Dictionary<string, int>? names = null;
         int dataStart, outRows;
-        if (hasHeaderRow)
+        if (useHeader)
         {
             names = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
             for (var c = 0; c < cols; c++)
@@ -209,7 +243,11 @@ public static class TextUtilities
         var result = new object[outRows, 1];
         for (var r = 0; r < outRows; r++)
         {
-            result[r, 0] = RenderTemplate(template, data, dataStart + r, names, cols);
+            var rendered = RenderTemplate(template, data, dataStart + r, names, cols);
+            // A render longer than Excel's cell capacity cannot cross the boundary;
+            // embed the per-cell error the class contract promises instead of failing
+            // at marshal time.
+            result[r, 0] = rendered.Length > MaxCellChars ? (object)ExcelError.ExcelErrorValue : rendered;
         }
         return result;
     }
@@ -251,59 +289,81 @@ public static class TextUtilities
             return fallback;
         }
         var s = Marshaling.ToStringSafe(padChar);
-        return s.Length > 0 ? s[0] : fallback;
+        if (s.Length == 0)
+        {
+            return fallback;
+        }
+        if (char.IsSurrogate(s[0]))
+        {
+            // Taking s[0] of an astral pad char would fill every cell with lone
+            // surrogate halves - ill-formed UTF-16.
+            throw new ArgumentException("pad_char must be a single basic-plane character.");
+        }
+        return s[0];
     }
 
-    private static string ToProper(string s)
+    private static string ToProper(string s, StringBuilder sb)
     {
-        var sb = new StringBuilder(s.Length);
+        // Rune-wise iteration so supplementary-plane letters are classified and cased
+        // as letters; a char-wise loop sees their surrogate halves as non-letters and
+        // wrongly restarts the word after them.
+        sb.Clear();
+        Span<char> buffer = stackalloc char[2];
         var newWord = true;
-        foreach (var ch in s)
+        foreach (var rune in s.EnumerateRunes())
         {
-            if (char.IsLetter(ch))
+            if (Rune.IsLetter(rune))
             {
-                sb.Append(newWord ? char.ToUpperInvariant(ch) : char.ToLowerInvariant(ch));
+                var cased = newWord ? Rune.ToUpperInvariant(rune) : Rune.ToLowerInvariant(rune);
+                sb.Append(buffer[..cased.EncodeToUtf16(buffer)]);
                 newWord = false;
             }
             else
             {
-                sb.Append(ch);
+                sb.Append(buffer[..rune.EncodeToUtf16(buffer)]);
                 newWord = true;
             }
         }
         return sb.ToString();
     }
 
-    private static string ToCamel(string s)
+    private static string ToCamel(string s, StringBuilder sb)
     {
-        var sb = new StringBuilder(s.Length);
-        var i = 0;
-        while (i < s.Length)
+        // Rune-wise so astral letters/digits count as word characters instead of being
+        // silently deleted as separators (char.IsLetterOrDigit is false for both halves
+        // of a surrogate pair).
+        sb.Clear();
+        Span<char> buffer = stackalloc char[2];
+        var wordStart = true;
+        foreach (var rune in s.EnumerateRunes())
         {
-            // Skip separators between words.
-            while (i < s.Length && !char.IsLetterOrDigit(s[i]))
+            if (!Rune.IsLetterOrDigit(rune))
             {
-                i++;
+                wordStart = true;
+                continue;
             }
-            if (i >= s.Length)
-            {
-                break;
-            }
-            // Consume one word and Pascal-case it.
-            var first = true;
-            while (i < s.Length && char.IsLetterOrDigit(s[i]))
-            {
-                var ch = s[i];
-                sb.Append(first ? char.ToUpperInvariant(ch) : char.ToLowerInvariant(ch));
-                first = false;
-                i++;
-            }
-        }
-        if (sb.Length > 0)
-        {
-            sb[0] = char.ToLowerInvariant(sb[0]);
+            var cased = wordStart
+                ? (sb.Length == 0 ? Rune.ToLowerInvariant(rune) : Rune.ToUpperInvariant(rune))
+                : Rune.ToLowerInvariant(rune);
+            sb.Append(buffer[..cased.EncodeToUtf16(buffer)]);
+            wordStart = false;
         }
         return sb.ToString();
+    }
+
+    private static bool ResolveBool(object value, bool defaultValue)
+    {
+        if (Marshaling.IsBlankOrError(value))
+        {
+            return defaultValue;
+        }
+        return value switch
+        {
+            bool b => b,
+            double d => d != 0d,
+            string s => s.Equals("TRUE", StringComparison.OrdinalIgnoreCase) || s == "1",
+            _ => defaultValue,
+        };
     }
 
     private static string RenderTemplate(string template, object[,] data, int row, Dictionary<string, int>? names, int cols)
