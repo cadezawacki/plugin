@@ -51,6 +51,9 @@ public static class JsonUtilities
         var rows = json.GetLength(0);
         var cols = json.GetLength(1);
         var result = new object[rows, cols];
+        // Compile the path once per call; re-tokenizing it per cell costs ~100 B of
+        // substring churn and ~300 ns each across the whole block.
+        var validPath = TryCompilePath(path, out var steps);
         for (var r = 0; r < rows; r++)
         {
             for (var c = 0; c < cols; c++)
@@ -64,7 +67,7 @@ public static class JsonUtilities
                 try
                 {
                     using var doc = JsonDocument.Parse(Marshaling.ToStringSafe(cell));
-                    result[r, c] = TryNavigate(doc.RootElement, path, out var node)
+                    result[r, c] = validPath && TryNavigate(doc.RootElement, steps, out var node)
                         ? JsonToCell(node)
                         : ExcelError.ExcelErrorNA;
                 }
@@ -89,9 +92,13 @@ public static class JsonUtilities
     [ExcelFunction(Name = "EPT.PARSEJSON", Description = "Parse a JSON document into a spilled table.", Category = "EPT.Json", IsThreadSafe = true, IsVolatile = false)]
     public static object[,] ParseJson(
         [ExcelArgument(Name = "json", Description = "A single JSON document.")] string json,
-        [ExcelArgument(Name = "path", Description = "Optional sub-node path to expand.")] string? path = null,
-        [ExcelArgument(Name = "has_header_row", Description = "TRUE (default) emits a header row for arrays of objects.")] bool hasHeaderRow = true)
+        [ExcelArgument(Name = "path", Description = "Optional sub-node path to expand.")] object path,
+        [ExcelArgument(Name = "has_header_row", Description = "TRUE (default) emits a header row for arrays of objects.")] object hasHeaderRow)
     {
+        // Excel-DNA's built-in registration ignores C# default parameter values: an
+        // omitted bool arrives as xltypeMissing and would marshal to FALSE, silently
+        // dropping the documented header row. Take both optionals as object and decode
+        // them, exactly as the sibling file UDFs already do.
         if (string.IsNullOrEmpty(json))
         {
             return new object[1, 1] { { ExcelEmpty.Value } };
@@ -99,11 +106,11 @@ public static class JsonUtilities
         try
         {
             using var doc = JsonDocument.Parse(json);
-            if (!TryNavigate(doc.RootElement, path, out var node))
+            if (!TryNavigate(doc.RootElement, PathOf(path), out var node))
             {
                 return new object[1, 1] { { ExcelError.ExcelErrorNA } };
             }
-            return ExpandToTable(node, hasHeaderRow);
+            return ExpandToTable(node, ResolveBool(hasHeaderRow, true));
         }
         catch (JsonException)
         {
@@ -125,8 +132,18 @@ public static class JsonUtilities
         {
             throw new ArgumentException("Path is required.", nameof(path));
         }
-        var bytes = await File.ReadAllBytesAsync(path, cancellationToken).ConfigureAwait(false);
-        using var doc = JsonDocument.Parse(bytes);
+        // JsonDocument.Parse(byte[]) rejects a UTF-8 BOM ('0xEF' is an invalid start
+        // of a value), failing every Notepad/PowerShell-written file; the stream path
+        // skips the BOM and rents pooled buffers instead of materializing the whole
+        // file as one LOH byte[].
+        await using var stream = new FileStream(
+            path,
+            FileMode.Open,
+            FileAccess.Read,
+            FileShare.Read,
+            bufferSize: DirectFileIO.DefaultBufferSize,
+            options: FileOptions.Asynchronous | FileOptions.SequentialScan);
+        using var doc = await JsonDocument.ParseAsync(stream, default, cancellationToken).ConfigureAwait(false);
         if (!TryNavigate(doc.RootElement, pointer, out var node))
         {
             return new object[1, 1] { { ExcelError.ExcelErrorNA } };
@@ -156,38 +173,65 @@ public static class JsonUtilities
         using var reader = new StreamReader(stream, Encoding.UTF8, detectEncodingFromByteOrderMarks: true, bufferSize: DirectFileIO.DefaultBufferSize);
 
         var order = new List<string>();
-        var seen = new HashSet<string>(StringComparer.Ordinal);
-        var rows = new List<Dictionary<string, object>>(256);
+        var index = new Dictionary<string, int>(StringComparer.Ordinal);
+        var rows = new List<object?[]>(256);
+        var lineNumber = 0;
 
         while (await reader.ReadLineAsync(cancellationToken).ConfigureAwait(false) is { } line)
         {
+            lineNumber++;
             if (string.IsNullOrWhiteSpace(line))
             {
                 continue;
             }
-            using var doc = JsonDocument.Parse(line);
-            var element = doc.RootElement;
-            var dict = new Dictionary<string, object>(StringComparer.Ordinal);
-            if (element.ValueKind == JsonValueKind.Object)
+            JsonDocument doc;
+            try
             {
-                foreach (var prop in element.EnumerateObject())
+                doc = JsonDocument.Parse(line);
+            }
+            catch (JsonException ex)
+            {
+                // The per-line parser only knows line-relative positions ("LineNumber:
+                // 0"); rethrow with the real file position so the trace is actionable.
+                throw new JsonException($"Invalid JSON on line {lineNumber} of '{path}': {ex.Message}", ex);
+            }
+            using (doc)
+            {
+                var element = doc.RootElement;
+                // Rows are column-indexed object[]s, not per-row dictionaries (~600 B
+                // of bucket/entry overhead per row at 10 keys).
+                if (element.ValueKind == JsonValueKind.Object)
                 {
-                    if (seen.Add(prop.Name))
+                    var row = new object?[index.Count];
+                    foreach (var prop in element.EnumerateObject())
                     {
-                        order.Add(prop.Name);
+                        if (!index.TryGetValue(prop.Name, out var col))
+                        {
+                            col = order.Count;
+                            index.Add(prop.Name, col);
+                            order.Add(prop.Name);
+                        }
+                        if (col >= row.Length)
+                        {
+                            Array.Resize(ref row, col + 1);
+                        }
+                        row[col] = JsonToCell(prop.Value);
                     }
-                    dict[prop.Name] = JsonToCell(prop.Value);
+                    rows.Add(row);
                 }
-            }
-            else
-            {
-                if (seen.Add("value"))
+                else
                 {
-                    order.Add("value");
+                    if (!index.TryGetValue("value", out var col))
+                    {
+                        col = order.Count;
+                        index.Add("value", col);
+                        order.Add("value");
+                    }
+                    var row = new object?[col + 1];
+                    row[col] = JsonToCell(element);
+                    rows.Add(row);
                 }
-                dict["value"] = JsonToCell(element);
             }
-            rows.Add(dict);
         }
 
         if (rows.Count == 0)
@@ -370,7 +414,7 @@ public static class JsonUtilities
 
     private static object JsonToCell(JsonElement element) => element.ValueKind switch
     {
-        JsonValueKind.Number => element.TryGetDouble(out var d) ? d : (object)element.GetRawText(),
+        JsonValueKind.Number => NumberToCell(element),
         JsonValueKind.String => element.GetString() ?? string.Empty,
         JsonValueKind.True => true,
         JsonValueKind.False => false,
@@ -378,6 +422,26 @@ public static class JsonUtilities
         JsonValueKind.Undefined => ExcelEmpty.Value,
         _ => element.GetRawText(),
     };
+
+    /// <summary>2^53: the largest integer a double can hold exactly.</summary>
+    private const long MaxExactDoubleInteger = 9_007_199_254_740_992;
+
+    private static object NumberToCell(JsonElement element)
+    {
+        // On .NET Core, TryGetDouble never fails for a syntactically valid JSON number:
+        // integers beyond 2^53 silently lose their low digits (snowflake IDs, bigints,
+        // ticks) and out-of-range literals come back as Infinity, which Excel renders
+        // as #NUM!. Preserve the digits as text instead.
+        if (element.TryGetInt64(out var l))
+        {
+            return l is >= -MaxExactDoubleInteger and <= MaxExactDoubleInteger
+                ? (double)l
+                : (object)element.GetRawText();
+        }
+        return element.TryGetDouble(out var d) && double.IsFinite(d)
+            ? d
+            : (object)element.GetRawText();
+    }
 
     private static void WriteCellJson(Utf8JsonWriter writer, object? cell)
     {
@@ -451,20 +515,26 @@ public static class JsonUtilities
         }
 
         var order = new List<string>();
-        var seen = new HashSet<string>(StringComparer.Ordinal);
-        var rows = new List<Dictionary<string, object>>(count);
+        var index = new Dictionary<string, int>(StringComparer.Ordinal);
+        var rows = new List<object?[]>(count);
         foreach (var el in array.EnumerateArray())
         {
-            var dict = new Dictionary<string, object>(StringComparer.Ordinal);
+            var row = new object?[index.Count];
             foreach (var prop in el.EnumerateObject())
             {
-                if (seen.Add(prop.Name))
+                if (!index.TryGetValue(prop.Name, out var col))
                 {
+                    col = order.Count;
+                    index.Add(prop.Name, col);
                     order.Add(prop.Name);
                 }
-                dict[prop.Name] = JsonToCell(prop.Value);
+                if (col >= row.Length)
+                {
+                    Array.Resize(ref row, col + 1);
+                }
+                row[col] = JsonToCell(prop.Value);
             }
-            rows.Add(dict);
+            rows.Add(row);
         }
         return BuildObjectTable(order, rows, hasHeaderRow);
     }
@@ -493,7 +563,7 @@ public static class JsonUtilities
         return result;
     }
 
-    private static object[,] BuildObjectTable(List<string> order, List<Dictionary<string, object>> rows, bool emitHeader)
+    private static object[,] BuildObjectTable(List<string> order, List<object?[]> rows, bool emitHeader)
     {
         var cols = Math.Max(order.Count, 1);
         var outRows = rows.Count + (emitHeader ? 1 : 0);
@@ -509,30 +579,43 @@ public static class JsonUtilities
         }
         for (var i = 0; i < rows.Count; i++)
         {
-            var dict = rows[i];
+            var row = rows[i];
             for (var c = 0; c < cols; c++)
             {
-                result[rowOffset + i, c] = c < order.Count && dict.TryGetValue(order[c], out var v)
-                    ? v
-                    : ExcelEmpty.Value;
+                // A bounds check + array read per cell instead of a string-hash probe.
+                result[rowOffset + i, c] = c < row.Length && row[c] is { } v ? v : ExcelEmpty.Value;
             }
         }
         return result;
     }
 
-    private static bool TryNavigate(JsonElement root, string? path, out JsonElement result)
+    private readonly struct PathStep
     {
-        result = root;
+        public PathStep(string? key, int index)
+        {
+            Key = key;
+            Index = index;
+        }
+
+        /// <summary>Object-property step when non-null; array-index step otherwise.</summary>
+        public string? Key { get; }
+
+        public int Index { get; }
+    }
+
+    /// <summary>
+    /// Tokenizes a dotted/indexed path once. False for a syntactically invalid path
+    /// (unclosed or non-numeric <c>[index]</c>), which navigates to nothing.
+    /// </summary>
+    private static bool TryCompilePath(string? path, out PathStep[] steps)
+    {
+        steps = Array.Empty<PathStep>();
         if (string.IsNullOrEmpty(path))
         {
             return true;
         }
-        var p = path;
-        if (p.StartsWith("$", StringComparison.Ordinal))
-        {
-            p = p.Substring(1);
-        }
-        var current = root;
+        var p = path.StartsWith("$", StringComparison.Ordinal) ? path.Substring(1) : path;
+        var list = new List<PathStep>();
         var i = 0;
         while (i < p.Length)
         {
@@ -546,17 +629,11 @@ public static class JsonUtilities
                 var end = p.IndexOf(']', i + 1);
                 if (end < 0
                     || !int.TryParse(p.AsSpan(i + 1, end - i - 1), System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out var idx)
-                    || idx < 0
-                    || current.ValueKind != JsonValueKind.Array)
+                    || idx < 0)
                 {
-                    result = default;
                     return false;
                 }
-                if (!TryGetArrayElement(current, idx, out current))
-                {
-                    result = default;
-                    return false;
-                }
+                list.Add(new PathStep(null, idx));
                 i = end + 1;
             }
             else
@@ -566,16 +643,44 @@ public static class JsonUtilities
                 {
                     i++;
                 }
-                var key = p.Substring(start, i - start);
-                if (current.ValueKind != JsonValueKind.Object || !current.TryGetProperty(key, out current))
+                list.Add(new PathStep(p.Substring(start, i - start), 0));
+            }
+        }
+        steps = list.ToArray();
+        return true;
+    }
+
+    private static bool TryNavigate(JsonElement root, PathStep[] steps, out JsonElement result)
+    {
+        var current = root;
+        foreach (var step in steps)
+        {
+            if (step.Key is null)
+            {
+                if (current.ValueKind != JsonValueKind.Array || !TryGetArrayElement(current, step.Index, out current))
                 {
                     result = default;
                     return false;
                 }
             }
+            else if (current.ValueKind != JsonValueKind.Object || !current.TryGetProperty(step.Key, out current))
+            {
+                result = default;
+                return false;
+            }
         }
         result = current;
         return true;
+    }
+
+    private static bool TryNavigate(JsonElement root, string? path, out JsonElement result)
+    {
+        if (!TryCompilePath(path, out var steps))
+        {
+            result = default;
+            return false;
+        }
+        return TryNavigate(root, steps, out result);
     }
 
     private static bool TryGetArrayElement(JsonElement array, int index, out JsonElement element)

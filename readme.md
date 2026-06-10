@@ -271,7 +271,7 @@ composite key.
 
 | Function | Signature | Description |
 | --- | --- | --- |
-| `EPT.XLOOKUPB` | `(lookupValues, lookupArray, returnArray, [ifNotFound], [matchMode]) -> object[,]` | Resolve a whole column of keys in one O(M+R) pass. Exact (hash) by default; `matchMode = FALSE` does sorted-ascending approximate (next-smaller) match. Result mirrors `lookupValues`' shape; misses return `ifNotFound` or `#N/A`. **`IsThreadSafe = true`.** |
+| `EPT.XLOOKUPB` | `(lookupValues, lookupArray, returnArray, [ifNotFound], [matchMode]) -> object[,]` | Resolve a whole column of keys in one O(M+R) pass. Exact (hash) by default (`matchMode` omitted, `TRUE`, or `0`); `matchMode = FALSE` or `-1` (XLOOKUP's next-smaller mode) does approximate match over the numeric keys, sorting them internally if needed. Exact match is type-aware like native XLOOKUP: numeric 5 never matches text `"5"`; errors in `lookupValues` propagate. Result mirrors `lookupValues`' shape; misses return `ifNotFound` or `#N/A`. **`IsThreadSafe = true`.** |
 
 ### Text utilities (`TextUtilities.cs`)
 
@@ -350,7 +350,10 @@ Internal .NET-only async entry points: `JsonUtilities.ReadJsonAsync`,
 | `EPT.WATCHFOLDER` | `(path) -> double` | yes | Live RTD change counter for a folder (non-recursive). |
 
 `WATCHFILE`/`WATCHFOLDER` plug `FileSystemWatcher`-backed feeds into the existing RTD
-server; bursts of events are coalesced by the server's 250 ms throttle.
+server; bursts of events are coalesced by the server's 250 ms throttle. Paths must be
+fully qualified. If the watched directory disappears (or the share drops) after the
+watch starts, the feed bumps once, then re-arms automatically and bumps again when the
+target is watchable - the trigger never dies silently.
 
 ### Result caching (`CacheUtilities.cs`)
 

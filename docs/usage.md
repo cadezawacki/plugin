@@ -615,7 +615,7 @@ g = Application.Run("EPT.GROUPBY", _
 Resolves an entire column of lookup keys in one O(M+R) pass: the lookup
 column is indexed once, then probed for every key. The result mirrors the
 shape of `lookup_values`. Exact match (default) is case-insensitive; pass
-`FALSE` as `match_mode` for sorted-ascending approximate (next-smaller)
+`FALSE` (or XLOOKUP's `-1`) as `match_mode` for approximate (next-smaller)
 match. Misses return `if_not_found` when supplied, otherwise `#N/A`.
 
 ```

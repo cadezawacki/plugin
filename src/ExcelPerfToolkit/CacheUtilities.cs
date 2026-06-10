@@ -115,21 +115,23 @@ public static class CacheUtilities
         return Memory.TryRemove(Marshaling.ToStringSafe(key), out _) ? 1d : 0d;
     }
 
+    /// <summary>Entries evicted per scan once the cap is exceeded.</summary>
+    private const int EvictBatch = 64;
+
     private static void EvictOldest()
     {
-        string? oldestKey = null;
-        var oldest = long.MaxValue;
+        // Evict a batch per scan: a single full enumeration amortized over 64 inserts
+        // instead of an O(N) walk on every Memoize past the cap.
+        var entries = new List<(long Stamp, string Key)>(Memory.Count);
         foreach (var kv in Memory)
         {
-            if (kv.Value.Stamp < oldest)
-            {
-                oldest = kv.Value.Stamp;
-                oldestKey = kv.Key;
-            }
+            entries.Add((kv.Value.Stamp, kv.Key));
         }
-        if (oldestKey is not null)
+        entries.Sort(static (a, b) => a.Stamp.CompareTo(b.Stamp));
+        var toRemove = Math.Min(EvictBatch, entries.Count);
+        for (var i = 0; i < toRemove; i++)
         {
-            Memory.TryRemove(oldestKey, out _);
+            Memory.TryRemove(entries[i].Key, out _);
         }
     }
 
@@ -154,7 +156,7 @@ public static class CacheUtilities
         ArgumentNullException.ThrowIfNull(block);
         try
         {
-            WriteDiskAsync(DiskPath(key), block, ToolkitLifetime.ShutdownToken)
+            WriteDiskAsync(DiskPath(key, ensureDirectory: true), block, ToolkitLifetime.ShutdownToken)
                 .ConfigureAwait(false)
                 .GetAwaiter()
                 .GetResult();
@@ -254,38 +256,63 @@ public static class CacheUtilities
 
     private static async Task WriteDiskAsync(string path, object[,] block, CancellationToken cancellationToken)
     {
-        await using var stream = new FileStream(
-            path,
-            FileMode.Create,
-            FileAccess.Write,
-            FileShare.Read,
-            bufferSize: DirectFileIO.DefaultBufferSize,
-            options: FileOptions.Asynchronous | FileOptions.SequentialScan);
-        await using var writer = new Utf8JsonWriter(stream);
-
-        var rows = block.GetLength(0);
-        var cols = block.GetLength(1);
-        writer.WriteStartObject();
-        writer.WriteNumber("rows", rows);
-        writer.WriteNumber("cols", cols);
-        writer.WriteStartArray("cells");
-        for (var r = 0; r < rows; r++)
+        // Write to a sibling temp file and atomically swap it in. Truncate-in-place
+        // destroyed the previous good entry the moment the stream opened, so any
+        // cancel/crash mid-write left a torn file that poisoned every later read of
+        // that key. File.Move(overwrite) is an atomic same-volume replace: readers
+        // (including other Excel instances) see the old or the new entry, never a mix.
+        var tmp = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
+        try
         {
-            cancellationToken.ThrowIfCancellationRequested();
-            writer.WriteStartArray();
-            for (var c = 0; c < cols; c++)
+            await using (var stream = new FileStream(
+                tmp,
+                FileMode.CreateNew,
+                FileAccess.Write,
+                FileShare.None,
+                bufferSize: DirectFileIO.DefaultBufferSize,
+                options: FileOptions.Asynchronous | FileOptions.SequentialScan))
+            await using (var writer = new Utf8JsonWriter(stream))
             {
-                WriteTypedCell(writer, block[r, c]);
-            }
-            writer.WriteEndArray();
-            if (writer.BytesPending > DirectFileIO.DefaultBufferSize)
-            {
+                var rows = block.GetLength(0);
+                var cols = block.GetLength(1);
+                writer.WriteStartObject();
+                writer.WriteNumber("rows", rows);
+                writer.WriteNumber("cols", cols);
+                writer.WriteStartArray("cells");
+                for (var r = 0; r < rows; r++)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    writer.WriteStartArray();
+                    for (var c = 0; c < cols; c++)
+                    {
+                        WriteTypedCell(writer, block[r, c]);
+                    }
+                    writer.WriteEndArray();
+                    if (writer.BytesPending > DirectFileIO.DefaultBufferSize)
+                    {
+                        await writer.FlushAsync(cancellationToken).ConfigureAwait(false);
+                    }
+                }
+                writer.WriteEndArray();
+                writer.WriteEndObject();
                 await writer.FlushAsync(cancellationToken).ConfigureAwait(false);
             }
+            File.Move(tmp, path, overwrite: true);
         }
-        writer.WriteEndArray();
-        writer.WriteEndObject();
-        await writer.FlushAsync(cancellationToken).ConfigureAwait(false);
+        catch
+        {
+            try
+            {
+                File.Delete(tmp);
+            }
+            catch (IOException)
+            {
+            }
+            catch (UnauthorizedAccessException)
+            {
+            }
+            throw;
+        }
     }
 
     private static async Task<object[,]?> ReadDiskAsync(string path, CancellationToken cancellationToken)
@@ -294,9 +321,41 @@ public static class CacheUtilities
         {
             return null;
         }
-        var bytes = await File.ReadAllBytesAsync(path, cancellationToken).ConfigureAwait(false);
-        using var doc = JsonDocument.Parse(bytes);
-        var root = doc.RootElement;
+        JsonDocument doc;
+        try
+        {
+            await using var stream = new FileStream(
+                path,
+                FileMode.Open,
+                FileAccess.Read,
+                FileShare.Read,
+                bufferSize: DirectFileIO.DefaultBufferSize,
+                options: FileOptions.Asynchronous | FileOptions.SequentialScan);
+            doc = await JsonDocument.ParseAsync(stream, default, cancellationToken).ConfigureAwait(false);
+        }
+        catch (FileNotFoundException)
+        {
+            return null;
+        }
+        catch (JsonException)
+        {
+            // A torn or corrupt entry is a MISS, not an error: callers fall back to
+            // ifMissing instead of returning #VALUE! forever. Delete it so the cache
+            // heals rather than re-parsing the same damage on every read.
+            try
+            {
+                File.Delete(path);
+            }
+            catch (IOException)
+            {
+            }
+            catch (UnauthorizedAccessException)
+            {
+            }
+            return null;
+        }
+        using var document = doc;
+        var root = document.RootElement;
         var rows = root.GetProperty("rows").GetInt32();
         var cols = root.GetProperty("cols").GetInt32();
         if (rows < 0 || cols < 0 || (long)rows * cols > int.MaxValue)
@@ -371,7 +430,11 @@ public static class CacheUtilities
         JsonValueKind.True => true,
         JsonValueKind.False => false,
         JsonValueKind.Null => ExcelEmpty.Value,
-        JsonValueKind.Object => element.TryGetProperty("$err", out var ep) && ep.TryGetInt32(out var ev)
+        // C# enum casts do not range-check; an undefined ExcelError payload would be
+        // handed to Excel's marshaler as an undefined error state.
+        JsonValueKind.Object => element.TryGetProperty("$err", out var ep)
+                && ep.TryGetInt32(out var ev)
+                && Enum.IsDefined(typeof(ExcelError), ev)
             ? (ExcelError)ev
             : (object)element.GetRawText(),
         _ => ExcelEmpty.Value,
@@ -384,10 +447,15 @@ public static class CacheUtilities
     private static string CacheDirectory()
         => Path.Combine(Path.GetTempPath(), "ExcelPerfToolkit", "diskcache");
 
-    private static string DiskPath(string key)
+    private static string DiskPath(string key, bool ensureDirectory = false)
     {
         var dir = CacheDirectory();
-        Directory.CreateDirectory(dir);
+        if (ensureDirectory)
+        {
+            // Reads and clears don't need the metadata syscall: a missing directory
+            // simply means a miss / nothing to delete.
+            Directory.CreateDirectory(dir);
+        }
         var hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(key)));
         return Path.Combine(dir, hash + ".json");
     }

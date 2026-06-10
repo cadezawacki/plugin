@@ -124,12 +124,18 @@ public static class Marshaling
                     result = 0d;
                     return false;
                 }
-                return double.TryParse(
+                // On .NET Core 3.0+, double.TryParse succeeds for "NaN", "Infinity", and
+                // out-of-range literals like "1e999" (returning ±Infinity). The contract
+                // here is "finite double", so re-check finiteness after either parse —
+                // a single non-finite text cell must not poison sort-based consumers
+                // (QUANTILES, OUTLIERS, DISTANCE).
+                return (double.TryParse(
                     s,
                     NumberStyles.Float,
                     CultureInfo.InvariantCulture,
                     out result)
-                    || double.TryParse(s, NumberStyles.Float | NumberStyles.AllowThousands, CultureInfo.CurrentCulture, out result);
+                    || double.TryParse(s, NumberStyles.Float | NumberStyles.AllowThousands, CultureInfo.CurrentCulture, out result))
+                    && double.IsFinite(result);
             default:
                 result = 0d;
                 return false;
